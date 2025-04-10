@@ -1,6 +1,8 @@
 import os
 import shutil
 from pathlib import Path
+from emoles.constant import convention_dict
+import numpy as np
 
 
 def setup_output_directory(output_path):

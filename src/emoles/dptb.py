@@ -240,7 +240,7 @@ if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Setup output directory and database
-    setup_output_directory(output_path, db_path)
+    setup_output_directory(output_path)
     abs_db_path = setup_db_path(db_path)
 
     # Load model
