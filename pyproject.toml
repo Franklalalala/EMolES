@@ -1,9 +1,51 @@
 [build-system]
-# AVOID CHANGING REQUIRES: IT WILL BE UPDATED BY PYSCAFFOLD!
-requires = ["setuptools>=46.1.0", "setuptools_scm[toml]>=5"]
+requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools_scm]
-# For smarter version schemes and other configuration options,
-# check out https://github.com/pypa/setuptools_scm
-version_scheme = "no-guess-dev"
+[project]
+name = "EMolES"
+dynamic = ["version"]
+readme = "README.md"
+description = "A repo to calculate the electronic structures of electrolyte molecules."
+readme = "README.md"
+authors = [
+    {name = "Liu Mingkang", email = "1660810667@qq.com"}
+]
+license = {file = "LICENSE.txt"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Science/Research",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "dptb",
+    "scipy",
+    "pyscf",
+    "scikit-learn",
+    "tqdm",
+    "torch",
+    "py3Dmol",
+    "mokit",
+]
+
+[tool.setuptools.dynamic]
+version = {file = ["version.txt"]}
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov",
+    "black",
+    "isort",
+    "flake8",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/Franklalalala/EMolES"
+"Bug Tracker" = "https://github.com/Franklalalala/EMolES/issues"
+
+[tool.setuptools]
+packages = ["emoles"]
+
