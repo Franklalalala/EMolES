@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/Franklalalala/EMolES/compare/v1.0.0...v1.0.1) (2025-04-10)
+
+
+### Bug Fixes
+
+* new version ([c580514](https://github.com/Franklalalala/EMolES/commit/c580514ac28019d49cef80ea2acb694a48d978b6))
+
 ## 1.0.0 (2025-04-10)
 
 
