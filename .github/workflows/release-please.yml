@@ -8,6 +8,7 @@ name: release-please
 permissions:
   contents: write
   pull-requests: write
+  labels: write 
 
 jobs:
   release-please:
