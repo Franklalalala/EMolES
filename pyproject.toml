@@ -7,7 +7,6 @@ name = "EMolES"
 dynamic = ["version"]
 readme = "README.md"
 description = "A repo to calculate the electronic structures of electrolyte molecules."
-readme = "README.md"
 authors = [
     {name = "Liu Mingkang", email = "1660810667@qq.com"}
 ]
@@ -27,7 +26,6 @@ dependencies = [
     "tqdm",
     "torch",
     "py3Dmol",
-    "mokit",
 ]
 
 [tool.setuptools.dynamic]
