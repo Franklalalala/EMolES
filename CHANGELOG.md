@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/Franklalalala/EMolES/compare/v1.1.0...v1.2.0) (2025-04-13)
+
+
+### Features
+
+* add multiwfn inference api ([ab1016c](https://github.com/Franklalalala/EMolES/commit/ab1016c43e5828aabd1608e84bd6bc41d22ac544))
+
 ## [1.1.0](https://github.com/Franklalalala/EMolES/compare/v1.0.1...v1.1.0) (2025-04-13)
 
 
