@@ -201,7 +201,6 @@ def test_with_npy(abs_ase_path, npy_folder_path, gau_npy_folder_path, temp_data_
                 predicted_ham, predicted_overlap = prepare_np(atom_symbols=atom_nums, overlap_matrix=predicted_overlap,
                                                               full_hamiltonian=predicted_ham, transform_ham_flag=True,
                                                               transform_overlap_flag=True, convention=convention)
-
             else:
                 gau_ham, _ = load_gaussian_data(idx, gau_npy_folder_path, united_overlap_flag)
                 target_overlap = mol.intor("int1e_ovlp")

@@ -4,7 +4,7 @@ from pprint import pprint
 import shutil
 from emoles.loss import test_with_npy
 from emoles.pyscf import generate_cube_files
-from emoles.py3Dmol import batch_visualize_cube_file
+from emoles.py3Dmol import cubes_2_htmls
 
 
 if __name__ == '__main__':
@@ -38,4 +38,4 @@ if __name__ == '__main__':
     generate_cube_files(temp_data_file, n_grid, cube_dump_place)
 
     # Assuming batch_visualize_cube_file is defined elsewhere
-    batch_visualize_cube_file(cube_dump_place)
+    cubes_2_htmls(cube_dump_place, 0.03)
