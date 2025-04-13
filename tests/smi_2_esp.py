@@ -27,11 +27,6 @@ dptb_infer_from_ase_db(ase_db_path=ase_db_path, out_path=out_path, limit=limit,
                        input_path=input_json_path, checkpoint_path=pth_path,
                        device=device)
 
-# 2. get cube files with pyscf overlap
+# 2. get esp values with pyscf overlap and multiwfn
 calculate_with_multiwfn(ase_db_path=ase_db_path, out_path=out_path, n_grid=75, esp_flag=True, limit=limit, basis='6311gdp')
-
-# 3. visualize cube files
-cubes_2_htmls(out_path='ham_output', iso_value=0.03)
-
-
 
