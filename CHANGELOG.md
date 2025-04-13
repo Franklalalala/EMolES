@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0](https://github.com/Franklalalala/EMolES/compare/v1.0.1...v1.1.0) (2025-04-13)
+
+
+### Features
+
+* add dptb inference pipeline ([1080fb7](https://github.com/Franklalalala/EMolES/commit/1080fb77a2eec28a45f06490b3b592a011e76355))
+
 ## [1.0.1](https://github.com/Franklalalala/EMolES/compare/v1.0.0...v1.0.1) (2025-04-10)
 
 
