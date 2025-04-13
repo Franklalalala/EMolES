@@ -131,6 +131,60 @@ def generate_cube_files(ase_db_path: str, out_path: str, n_grid, basis='def2svp'
     os.chdir(cwd_)
 
 
+def calculate_with_multiwfn(ase_db_path: str, out_path: str, n_grid, basis='def2svp', esp_flag=False, keep_xyz_file: bool=True, dm_grid: int=40, limit: int=2):
+    from pyscf.scf.hf import make_rdm1, dip_moment
+    from pyscf import tools, dft
+    from emoles.multiwfn import ESPCalculator
+    from mokit.lib.py2fch_direct import fchk
+
+    """Generate cube files for HOMO and LUMO orbitals and save them in sub-folders named by idx."""
+    if basis == 'def2svp':
+        transform_convention = 'back2pyscf'
+        overlap_basis = 'def2svp'
+    elif basis == '6311gdp':
+        transform_convention = 'back_2_thu_pyscf'
+        overlap_basis = '6-311+g(d,p)'
+    else:
+        raise NotImplementedError
+    energy_info_collector = info_collector()
+    cwd_ = os.getcwd()
+    abs_out_path = os.path.abspath(out_path)
+    cube_dump_place = os.path.join(abs_out_path, 'cube')
+    with connect(ase_db_path) as db:
+        for idx, a_row in enumerate(db.select()):
+            an_atoms = a_row.toatoms()
+            overlap, mol = get_overlap_matrix(ase_atoms=an_atoms, basis=overlap_basis)
+            os.chdir(cube_dump_place)
+            os.chdir(str(idx))
+            predicted_ham = np.load('predicted_ham.npy')
+            hamiltonian, overlap = prepare_np(overlap_matrix=overlap, full_hamiltonian=predicted_ham, atom_numbers=an_atoms.numbers, transform_ham_flag=True, transform_overlap_flag=False, transform_convention=transform_convention)
+            orbital_energies, orbital_coefficients = cal_orbital_and_energies(overlap_matrix=overlap, full_hamiltonian=hamiltonian)
+            mf = dft.RKS(mol)
+            mf.mo_coeff = orbital_coefficients
+            mf.mo_energy = orbital_energies
+            fchk(mf, 'predicted.fch', density=True)
+
+            homo_idx = int(sum(an_atoms.numbers) / 2) - 1
+            energy_info_collector.parse_orbital_energies(orbital_energies=orbital_energies, homo_index=homo_idx)
+            # HOMO_coefficients, LUMO_coefficients = orbital_coefficients[:, homo_idx], orbital_coefficients[:, homo_idx+1]
+
+            if esp_flag:
+                esp_calculator = ESPCalculator("predicted.fch")
+                esp_results, cube_file = esp_calculator.calculate_grid_data()
+                with open('esp_info.json', 'w') as f:
+                    json.dump(esp_results, fp=f)
+
+            if keep_xyz_file:
+                write('atomic_structure.xyz', an_atoms)
+
+            if idx == limit - 1:
+                break
+
+    csv_path = os.path.join(abs_out_path, 'energy_info.csv')
+    energy_info_collector.dump_to_csv(csv_path=csv_path)
+    os.chdir(cwd_)
+
+
 def mol_2_atom(mol: rdkit.Chem.rdchem.Mol):
     conf = mol.GetConformer()
     an_atoms = Atoms()
