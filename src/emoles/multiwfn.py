@@ -147,11 +147,12 @@ class ESPCalculator(MultiwfnRunner):
             Dictionary containing ESP maximum and minimum values and their locations
         """
         # Initialize results dictionary
+        # To do: compare the units
         esp_data = {
-            'max_value': None,
-            'max_location': None,
-            'min_value': None,
-            'min_location': None
+            'max_value_kcal/mol': None,
+            'max_location_Bohr': None,
+            'min_value_kcal/mol': None,
+            'min_location_Bohr': None
         }
 
         # Regular expressions to match the ESP data
