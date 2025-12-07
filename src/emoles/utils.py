@@ -134,3 +134,66 @@ def generate_molecule_transform_indices(atom_types, atom_to_transform_indices):
         current_offset += max(atom_indices) + 1
 
     return molecule_transform_indices, atom_in_mo_indices
+
+
+def get_atom_in_mo_indices(atomic_numbers, convention_name, convention_dict):
+    """
+    输入：
+      - atomic_numbers: list of ints, e.g. [6, 1, 8]
+      - convention_name: str, e.g. 'pyscf_def2svp'
+      - convention_dict: dict-like mapping convention_name -> Namespace/dict, like your example
+
+    输出：
+      - atom_in_mo_indices: list of ints, length == total number of basis functions;
+        每个元素是该 MO 对应的原子索引（按传入 atomic_numbers 的顺序，从 0 开始）
+    """
+    # 获取 convention entry（支持 Namespace 或 dict）
+    conv = convention_dict.get(convention_name) if isinstance(convention_dict, dict) else convention_dict[convention_name]
+    # try both attribute and dict access
+    atom_to_orbitals_map = getattr(conv, 'atom_to_orbitals_map', None)
+    if atom_to_orbitals_map is None:
+        atom_to_orbitals_map = conv.get('atom_to_orbitals_map') if isinstance(conv, dict) else None
+    if atom_to_orbitals_map is None:
+        raise KeyError(f"convention {convention_name} 中找不到 'atom_to_orbitals_map'")
+
+    # 如何把壳字母展开为轨道数（常见：s=1, p=3, d=5, f=7）
+    shell_size = {'s': 1, 'p': 3, 'd': 5, 'f': 7}
+
+    atom_in_mo_indices = []
+    for atom_idx, Z in enumerate(atomic_numbers):
+        if Z not in atom_to_orbitals_map:
+            raise KeyError(f"convention {convention_name} 中没有原子 {Z} 的映射（atom_to_orbitals_map）")
+        shells = atom_to_orbitals_map[Z]  # e.g. 'ssp' or 'sssppd'
+        # 允许 shells 是字符串或 list（若 list 则元素像 's','p'）
+        if isinstance(shells, (list, tuple)):
+            shell_chars = ''.join(shells)
+        else:
+            shell_chars = str(shells)
+
+        local_orbital_count = 0
+        for ch in shell_chars:
+            ch_low = ch.lower()
+            if ch_low not in shell_size:
+                raise ValueError(f"未知的轨道字符 '{ch}'（仅支持 s,p,d,f）")
+            local_orbital_count += shell_size[ch_low]
+
+        atom_in_mo_indices.extend([atom_idx] * local_orbital_count)
+
+    return atom_in_mo_indices
+
+
+def cut_matrix(full_matrix, atom_in_mo_indices, threshold=1e-8):
+    partitioned_blocks = {}
+    atom_indeces = sorted(set(atom_in_mo_indices))
+    atom_positions = {atom: [i for i, x in enumerate(atom_in_mo_indices) if x == atom] for atom in atom_indeces}
+
+    # Extract blocks for each pair of atoms
+    for ii, i in enumerate(atom_indeces):
+        for j in atom_indeces[ii:]:
+            key = f"{i}_{j}_0_0_0"
+            rows = atom_positions[i]
+            cols = atom_positions[j]
+            block = full_matrix[np.ix_(rows, cols)]
+            if np.max(np.abs(block)) > threshold:
+                partitioned_blocks[key] = block
+    return partitioned_blocks

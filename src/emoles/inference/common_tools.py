@@ -10,10 +10,13 @@ from ase.io import write
 from ase.atom import Atom
 from ase.atoms import Atoms
 import pandas as pd
+import ase
 
 import rdkit
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from emoles.multiwfn import ESPCalculator
+from rdkit.Chem.rdDetermineBonds import DetermineBonds
 
 
 class info_collector:
@@ -185,6 +188,71 @@ def calculate_with_multiwfn(ase_db_path: str, out_path: str, n_grid, basis='def2
     os.chdir(cwd_)
 
 
+
+def calculate_esp_from_dm(mol, dm, prefix, gen_dm_flag=False):
+    """
+    A helper function to
+    1. generate an fchk file from a density matrix with help of mokit
+    2. compute ESP properties using Multiwfn.
+
+    Parameters:
+    -----------
+    mol : gto.Mole
+        PySCF molecule object.
+    dm : np.ndarray
+        Density matrix.
+    prefix : str
+        A prefix for all output files (e.g., "predicted", "target").
+
+    Returns:
+    --------
+    tuple
+        A tuple containing (ESP_max_in_eV, ESP_min_in_eV).
+    """
+    from mokit.lib.py2fch_direct import fchk
+    from pyscf import dft, tools
+
+    # 1. Set up and run PySCF DFT calculation from the density matrix
+    mf = dft.RKS(mol)
+    mf.xc = 'b3lyp'
+    fock = mf.get_fock(dm=dm)  # Build Fock matrix using the given density matrix
+    s = mf.get_ovlp()  # Get the overlap matrix
+
+    # Solve the generalized eigenvalue problem to get orbital energies and coefficients
+    orbital_energies, orbital_coefficients = mf.eig(fock, s)
+
+    # Store results in the mean-field object for fchk export
+    mf.mo_energy = orbital_energies
+    mf.mo_coeff = orbital_coefficients
+    mf.dm = dm
+
+    # 2. Generate a formatted checkpoint (.fchk) file
+    fch_filename = f"{prefix}.fch"
+    fchk(mf, fch_filename, density=True)
+
+    # 3. Initialize ESPCalculator and run Multiwfn tasks
+    esp_calculator = ESPCalculator(fch_filename)
+
+    # 3a. Get ESP surface extrema (values are in eV)
+    esp_results = esp_calculator.get_ESP_value()
+
+    # 3b. Generate high-quality grid files (density.cub and totesp_ev.cub)
+    # Note: The function handles renaming the files automatically
+    if gen_dm_flag:
+        grid_files = esp_calculator.get_acc_grid_data()
+
+    # 4. Save the parsed ESP extrema info to a JSON file for record-keeping
+    json_filename = f"{prefix}_esp_info.json"
+    with open(json_filename, 'w') as f:
+        json.dump(esp_results, fp=f, indent=4)
+
+    # 5. Extract and return the max and min ESP values
+    esp_max = esp_results.get('ESP_max_eV', 0)  # Use .get for safe access
+    esp_min = esp_results.get('ESP_min_eV', 0)
+
+    return esp_max, esp_min
+
+
 def mol_2_atom(mol: rdkit.Chem.rdchem.Mol):
     conf = mol.GetConformer()
     an_atoms = Atoms()
@@ -195,6 +263,22 @@ def mol_2_atom(mol: rdkit.Chem.rdchem.Mol):
         an_new_atom = Atom(symbol=a_symbol, position=(position.x, position.y, position.z))
         an_atoms.append(an_new_atom)
     return an_atoms
+
+
+def atom_2_mol(an_atoms: ase.atoms.Atoms):
+    write(filename='temp.xyz', images=an_atoms)
+    raw_mol = Chem.MolFromXYZFile('temp.xyz')
+    mol = Chem.Mol(raw_mol)
+    DetermineBonds(mol, useHueckel=True)
+    os.remove('temp.xyz')
+    return mol
+
+
+def atom_2_smile(an_atoms: ase.atoms.Atoms):
+    a_mol = atom_2_mol(an_atoms)
+    a_mol = Chem.RemoveHs(a_mol)
+    a_smile = Chem.MolToSmiles(a_mol, isomericSmiles=False)
+    return a_smile
 
 
 def smile_2_atom(smile: str, maxAttempts: int=1000000):
@@ -228,3 +312,4 @@ def smile_2_db(smile_path: str, db_path: str, fail_smile_path: str,  maxAttempts
                     f_f.write('\n')
     print(f'real: {real_count}')
     print(f'fail: {fail_count}')
+
