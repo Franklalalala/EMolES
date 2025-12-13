@@ -190,7 +190,9 @@ def save_atomic_structure(atomic_data, atomic_nums, db_path, an_err=None, additi
 
     if additional_data:
         data_content.update(additional_data)
-
+    if 'charge' in atomic_data.keys():
+        charge = atomic_data['charge'].cpu().numpy()
+        data_content.update({'charge': int(charge)})
     with connect(db_path) as db:
         if data_content:
             db.write(atoms, data=data_content)
