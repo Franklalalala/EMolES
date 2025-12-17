@@ -405,6 +405,123 @@ def process_dataset(data_loader, dataset, model, device, output_dir, db_path, ma
         return processing_time, float(loss_arr.mean())
 
 
+def process_dataset_num_e(data_loader, dataset, model, device, output_dir, db_path, max_items=None,
+                    err_info_file: str = 'err.txt', save_data_flag: bool = True,
+                    save_csr_info: dict = None, save_npy_flag: bool = False,
+                    save_disk_files: bool = True, save_disk_original: bool = True,
+                    split_dirs: bool = False,
+                    save_db_original: bool = False, save_db_predicted: bool = True):
+    from dptb.nnops.loss import HamilNumE
+    """
+    处理数据集，包含保存到 DB 和保存到磁盘（output_dir）的逻辑。
+    """
+    start_time = time.time()
+    type_mapper = dataset.type_mapper
+    has_overlap = dataset.get_overlap
+    loss_list = []
+
+    # 逻辑判断：是否真的进行磁盘写入
+    # 只有当 output_dir 存在 且 save_disk_files 为 True 且 (有保存NPY或CSR的需求) 时，才为 True
+    should_save_to_disk = (output_dir is not None) and save_disk_files and (save_npy_flag or save_csr_info is not None)
+
+    total_batches = len(data_loader) if hasattr(data_loader, '__len__') else None
+    if max_items is not None and total_batches is not None:
+        total_batches = min(total_batches, int(max_items / data_loader.batch_size))
+
+    model.eval()
+    with torch.no_grad():
+        for idx, batch in enumerate(tqdm(data_loader, desc="Processing", unit="batch", total=total_batches)):
+            if total_batches is not None and idx == total_batches:
+                break
+
+            batch_dict = AtomicData.to_AtomicDataDict(batch.to(device))
+
+            original_data = copy.deepcopy(batch_dict)
+
+            loss_func = HamilNumE(idp=model.hamiltonian.idp, device=device, num_e_loss_weight=0.01)
+            predicted_data = model(batch_dict)
+
+            a_loss = loss_func(predicted_data, original_data)
+            a_loss_val = a_loss.cpu().numpy()
+            loss_list.append(a_loss_val)
+
+            if save_data_flag:
+                assert data_loader.batch_size == 1, 'Currently, the save batch only support batch size = 1'
+
+                atomic_nums = original_data['atom_types'].cpu().reshape(-1)
+                atomic_nums = type_mapper.untransform(atomic_nums).numpy()
+
+                # 更新 CSR 保存所需的原子序数信息
+                if save_csr_info:
+                    save_csr_info.update({'atomic_numbers': atomic_nums})
+
+                # -----------------------------------------------
+                # 1. 智能计算 Blocks (避免重复，按需计算)
+                # -----------------------------------------------
+                # 判断条件：(存DB需要) 或者 (存磁盘需要 CSR)
+
+                # A. 预测数据 Blocks
+                need_pred_blocks = save_db_predicted or (should_save_to_disk and save_csr_info)
+                pred_blocks_tensor = None
+                if need_pred_blocks:
+                    pred_blocks_tensor = feature_to_block(data=predicted_data, idp=model.idp)
+
+                # B. 原始数据 Blocks
+                need_orig_blocks = save_db_original or (should_save_to_disk and save_disk_original and save_csr_info)
+                orig_blocks_tensor = None
+                if need_orig_blocks:
+                    orig_blocks_tensor = feature_to_block(data=original_data, idp=model.idp)
+
+                # -----------------------------------------------
+                # 2. 存入 ASE DB (将 Tensor Block 转为 Numpy)
+                # -----------------------------------------------
+                db_extra_data = {}
+
+                if save_csr_info:
+                    db_extra_data['csr_info'] = copy.deepcopy(save_csr_info)
+
+                if save_db_predicted and pred_blocks_tensor is not None:
+                    db_extra_data['predicted_data'] = convert_to_numpy_recursive(pred_blocks_tensor)
+
+                if save_db_original and orig_blocks_tensor is not None:
+                    db_extra_data['original_data'] = convert_to_numpy_recursive(orig_blocks_tensor)
+
+                save_atomic_structure(
+                    atomic_data=original_data,
+                    atomic_nums=atomic_nums,
+                    db_path=db_path,
+                    an_err=a_loss_val,
+                    additional_data=db_extra_data
+                )
+
+                # -----------------------------------------------
+                # 3. 存入 磁盘文件 (仅当 output_dir 存在且 switch 打开)
+                # -----------------------------------------------
+                if should_save_to_disk:
+                    save_batch_wrapper(
+                        output_dir=output_dir,
+                        idx=idx,
+                        original_data=original_data,
+                        predicted_data=predicted_data,
+                        model=model,
+                        device=device,
+                        has_overlap=has_overlap,
+                        save_csr_info=save_csr_info,
+                        save_npy=save_npy_flag,
+                        save_disk_original=save_disk_original,
+                        split_dirs=split_dirs,
+                        original_blocks=orig_blocks_tensor,  # 复用
+                        predicted_blocks=pred_blocks_tensor  # 复用
+                    )
+
+            torch.cuda.empty_cache()
+
+        end_time = time.time()
+        processing_time = (end_time - start_time) / (idx + 1)
+        loss_arr = np.array(loss_list)
+        return processing_time, float(loss_arr.mean())
+
+
 def process_dataset_dip(data_loader, dataset, model, device, output_dir, db_path, loss_func, max_items=None):
     # 此部分保持简略，如需扩展可参考 process_dataset
     start_time = time.time()

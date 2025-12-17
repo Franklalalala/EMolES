@@ -17,6 +17,48 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 from emoles.multiwfn import ESPCalculator
 from rdkit.Chem.rdDetermineBonds import DetermineBonds
+from collections import defaultdict
+
+
+def extract_model_params(model):
+    """
+    从 dptb 模型中提取 basis 和 r_max 参数，并转换为易读的格式。
+    """
+
+    # 1. 处理 r_max (Tensor -> float)
+    # model.embedding.init_layer.r_max_dict
+    raw_r_max = model.embedding.init_layer.r_max_dict
+    r_max_clean = {}
+
+    for elem, tensor_val in raw_r_max.items():
+        # .item() 将单元素 tensor 转换为 Python 原生 float
+        val = tensor_val.item()
+        r_max_clean[elem] = val
+
+    # 2. 处理 basis (List of strings -> Dense string "3s2p1d")
+    # model.embedding.basis
+    raw_basis = model.embedding.basis
+    basis_clean = {}
+    orbital_types = ['s', 'p', 'd', 'f']  # 定义顺序
+
+    for elem, orb_list in raw_basis.items():
+        # 统计每种轨道的数量
+        counts = defaultdict(int)
+        for orb in orb_list:
+            # 假设轨道字符串格式为 "1s", "2p" 等，最后一个字符是轨道类型
+            o_type = orb[-1]
+            counts[o_type] += 1
+
+        # 构建稠密字符串
+        dense_str = ""
+        for o_type in orbital_types:
+            count = counts[o_type]
+            if count > 0:
+                dense_str += f"{count}{o_type}"
+
+        basis_clean[elem] = dense_str
+
+    return basis_clean, r_max_clean
 
 
 class info_collector:
