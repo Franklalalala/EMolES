@@ -3,7 +3,9 @@ import shutil
 from pathlib import Path
 from emoles.constant import convention_dict
 import numpy as np
-
+from ase.db.core import connect
+import pickle
+import lmdb
 
 def setup_output_directory(output_path):
     """
@@ -197,3 +199,24 @@ def cut_matrix(full_matrix, atom_in_mo_indices, threshold=1e-8):
             if np.max(np.abs(block)) > threshold:
                 partitioned_blocks[key] = block
     return partitioned_blocks
+
+
+def update_ase_db_w_lmdb(src_ase_db_path, dump_ase_db_path, lmdb_path, update_keys_list: list=["iterations", "total_time"]):
+    db_env = lmdb.open(lmdb_path, readonly=True, lock=False)
+    with db_env.begin() as txn, connect(dump_ase_db_path) as dump_db, connect(src_ase_db_path) as src_db:
+        stat = txn.stat()
+        entries = stat['entries']
+        print(f'lmdb counts: {entries}')
+        db_counts = src_db.count()
+        print(f'src ase db counts: {db_counts}')
+        min_counts = min(db_counts, entries)
+        for idx in range(min_counts):
+            data_dict = txn.get(idx.to_bytes(length=4, byteorder='big'))
+            data_dict = pickle.loads(data_dict)
+            a_row = src_db.get(id=idx+1)
+            old_data = a_row.data
+            old_atoms = a_row.toatoms()
+            for a_key in update_keys_list:
+                an_item = data_dict[a_key]
+                old_data.update({a_key: an_item})
+            dump_db.write(old_atoms, data=old_data)

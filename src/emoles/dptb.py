@@ -293,8 +293,7 @@ def extract_csr_from_db(db_path: str, output_root: str,
 def process_dataset(data_loader, dataset, model, device, output_dir, db_path, max_items=None,
                     err_info_file: str = 'err.txt', save_data_flag: bool = True,
                     save_csr_info: dict = None, save_npy_flag: bool = False,
-                    save_disk_files: bool = True, save_disk_original: bool = True,
-                    split_dirs: bool = False,
+                    save_disk_files: bool = True, save_disk_original: bool = True, split_dirs: bool = False,
                     save_db_original: bool = False, save_db_predicted: bool = True):
     """
     处理数据集，包含保存到 DB 和保存到磁盘（output_dir）的逻辑。
