@@ -16,9 +16,9 @@ from ase.units import Hartree
 # PySCF imports
 import pyscf
 from pyscf import gto, dft, tools
-from pyscf.scf.hf import dip_moment, make_rdm1
+from pyscf.scf.hf import dip_moment
 
-# DPTB imports (Based on your provided file 2)
+# DPTB imports
 from dftio.data import _keys
 from dptb.nn.hr2hk import HR2HK, HR2HK_Gamma_Only
 from dptb.data import AtomicDataset, DataLoader, AtomicData, AtomicDataDict
@@ -27,97 +27,28 @@ from dptb.nn.build import build_model
 from dptb.utils.tools import j_loader
 from dptb.utils.argcheck import collect_cutoffs
 
-# EMOLES imports (Based on your provided file 1)
+# EMOLES imports
 from emoles.utils import (
     matrix_transform,
     get_mo_occ,
 )
 from emoles.inference.common_tools import atom_2_smile, calculate_esp_from_dm, extract_model_params
 
+# ---------------------------------------------------------
+# [New/Updated] Imports from emoles.loss & emoles.pyscf
+# Replaces local duplicated logic
+# ---------------------------------------------------------
+from emoles.pyscf import get_dipole_info
+from emoles.loss import (
+    get_electronic_properties,  # Replaces local definition
+    calculate_properties_from_dm,  # For dm_infer_entry
+    get_electron_number_from_dm  # For dm_infer_entry
+)
+
 
 # ==========================================
-# Helper Functions from Loss File
+# Helpers
 # ==========================================
-
-def cal_orbital_and_energies(overlap_matrix, full_hamiltonian):
-    """
-    Solve generalized eigenvalue problem HC = SCE.
-    Input matrices should be 3D (Batch, N, N) or 2D (N, N).
-    Returns energies and coefficients.
-    """
-    # Ensure inputs are 3D for consistent processing if they come in as 2D
-    if overlap_matrix.ndim == 2:
-        overlap_matrix = overlap_matrix[None, ...]
-    if full_hamiltonian.ndim == 2:
-        full_hamiltonian = full_hamiltonian[None, ...]
-
-    eigvals, eigvecs = np.linalg.eigh(overlap_matrix)
-    eps = 1e-8 * np.ones_like(eigvals)
-    eigvals = np.where(eigvals > 1e-8, eigvals, eps)
-    frac_overlap = eigvecs / np.sqrt(eigvals[:, np.newaxis])
-
-    Fs = np.matmul(
-        np.matmul(np.transpose(frac_overlap, (0, 2, 1)), full_hamiltonian),
-        frac_overlap,
-    )
-    orbital_energies, orbital_coefficients = np.linalg.eigh(Fs)
-    orbital_coefficients = frac_overlap @ orbital_coefficients
-
-    # Return the first item (assuming batch size 1 for inference scripts)
-    return orbital_energies[0], orbital_coefficients[0]
-
-
-def get_electronic_properties(mol, ham=None, overlap=None, dm=None):
-    """
-    Extract electronic properties (Energies, Orbitals, Gap) from Ham+Overlap.
-    """
-    # 1. Prepare Hamiltonian and Overlap
-    if ham is None:
-        if dm is None:
-            raise ValueError("Must provide either Hamiltonian or Density Matrix")
-        mf = dft.RKS(mol)
-        mf.xc = "b3lyp"
-        ham = mf.get_fock(dm=dm)
-        if overlap is None:
-            overlap = mf.get_ovlp()
-
-    if overlap is None:
-        overlap = mol.intor("int1e_ovlp")
-
-    # 2. Normalize dimensions to 2D for single molecule processing
-    ham_2d = ham[0] if ham.ndim == 3 else ham
-    ov_2d = overlap[0] if overlap.ndim == 3 else overlap
-
-    # 3. Solve Generalized Eigenvalue Problem
-    energies, coeffs = cal_orbital_and_energies(
-        overlap_matrix=ov_2d, full_hamiltonian=ham_2d
-    )
-
-    # 4. Determine Occupation and Indices
-    n_electrons = mol.tot_electrons()
-    # For closed shell RKS
-    homo_idx = int(n_electrons / 2) - 1
-    lumo_idx = homo_idx + 1
-
-    mo_occ = get_mo_occ(full_len=len(energies), occ_len=homo_idx + 1)
-
-    results = {
-        "HOMO": energies[homo_idx],
-        "LUMO": energies[lumo_idx],
-        "GAP": energies[lumo_idx] - energies[homo_idx],
-        "hamiltonian": ham_2d,
-        "overlap": ov_2d,
-        "mo_occ": mo_occ,
-        "orbital_coefficients": coeffs,  # Return full coeffs
-        "HOMO_coefficients": coeffs[:, homo_idx],
-        "LUMO_coefficients": coeffs[:, lumo_idx],
-        "occupied_orbital_energy": energies[: homo_idx + 1],
-        "all_energies": energies,
-        "homo_idx": homo_idx,
-        "lumo_idx": lumo_idx
-    }
-    return results
-
 
 def _load_npy_safe(path):
     if not os.path.exists(path):
@@ -130,6 +61,9 @@ def _load_npy_safe(path):
 # ==========================================
 
 def ase_db_2_dummy_dptb_lmdb(ase_db_path: str, dptb_lmdb_path: str):
+    if os.path.exists(dptb_lmdb_path):
+        shutil.rmtree(dptb_lmdb_path)
+
     dptb_lmdb_path = os.path.join(dptb_lmdb_path, "data.{}.lmdb".format(os.getpid()))
     os.makedirs(dptb_lmdb_path)
     lmdb_env = lmdb.open(dptb_lmdb_path, map_size=1048576000000, lock=True)
@@ -173,7 +107,7 @@ def save_info_2_npy(folder_path, idx, batch_info, model, device, has_overlap):
     ham_out_data = a_ham_hr2hk.forward(batch_info)
     a_ham = ham_out_data[AtomicDataDict.HAMILTONIAN_KEY]
     ham_ndarray = a_ham.real.cpu().numpy()
-    np.save('predicted.npy', ham_ndarray)  # Save as 2D if batch is 1 usually
+    np.save('predicted.npy', ham_ndarray)
 
     # Save Overlap if needed
     if has_overlap:
@@ -210,12 +144,14 @@ def dptb_infer_from_ase_db(ase_db_path: str, out_path: str,
     abs_out_path = os.path.abspath(out_path)
     ase_db_path = os.path.abspath(ase_db_path)
 
-    if os.path.exists(abs_out_path):
-        shutil.rmtree(abs_out_path)
-    os.makedirs(abs_out_path)
+    # if os.path.exists(abs_out_path):
+    #     shutil.rmtree(abs_out_path)
+    os.makedirs(abs_out_path, exist_ok=True)
 
     lmdb_path = os.path.join(abs_out_path, 'lmdb')
-    npy_path = os.path.join(abs_out_path, 'npy')
+    npy_path = os.path.join(abs_out_path, 'results')
+    if os.path.exists(npy_path):
+        shutil.rmtree(npy_path)
     os.makedirs(npy_path)
 
     ase_db_2_dummy_dptb_lmdb(ase_db_path, lmdb_path)
@@ -240,8 +176,8 @@ def dptb_infer_from_ase_db(ase_db_path: str, out_path: str,
         batch = AtomicData.to_AtomicDataDict(batch)
         with torch.no_grad():
             predicted_data = model(batch)
-        # Note: Saving as predicted_ham.npy now to be explicit
-        save_info_2_npy(folder_path=npy_path, idx=idx, batch_info=predicted_data, model=model, device=device, has_overlap=False)
+        save_info_2_npy(folder_path=npy_path, idx=idx, batch_info=predicted_data, model=model, device=device,
+                        has_overlap=False)
 
     end_time = time.time()
     print('DPTB inference done.')
@@ -258,7 +194,7 @@ def get_dm_info_from_npy(ase_db_path,
                          convert_smiles_flag=False,
                          convention='def2svp',
                          mol_charge=0,
-                         pred_dm_filename='predicted.npy',  # Updated filename convention if needed
+                         pred_dm_filename='predicted.npy',
                          transform_dm_flag=True,
                          get_esp_sta_flag=True,
                          get_dm_cube_flag=False,
@@ -297,7 +233,6 @@ def get_dm_info_from_npy(ase_db_path,
                 if convert_smiles_flag:
                     smiles = atom_2_smile(an_atoms)
 
-                # --- Charge & Spin Logic from Loss File ---
                 current_mol_charge = a_row.data.get("charge", mol_charge)
                 sum_of_atomic_numbers = an_atoms.get_atomic_numbers().sum()
                 total_electrons = sum_of_atomic_numbers - current_mol_charge
@@ -330,7 +265,7 @@ def get_dm_info_from_npy(ase_db_path,
                 # Calculate Properties
                 pred_esp_max, pred_esp_min = 0, 0
                 if get_esp_sta_flag:
-                    # Logic assumes calculate_esp_from_dm is imported or defined
+                    # Using common_tools version as per original logic for this function
                     pred_esp_max, pred_esp_min = calculate_esp_from_dm(mol, pred_dm, "pred", multiwfn_gen_dm_flag)
 
                 mol_dip = dip_moment(mol, pred_dm, unit='DEBYE')
@@ -339,7 +274,7 @@ def get_dm_info_from_npy(ase_db_path,
 
                 dm_info = {
                     'Index': idx,
-                    'SMILES': smiles,
+                    'SMILES': smiles if convert_smiles_flag else "",
                     'Charge': current_mol_charge,
                     'Dipole-X-Debye': to_sig4(mol_dip[0]),
                     'Dipole-Y-Debye': to_sig4(mol_dip[1]),
@@ -434,7 +369,6 @@ def get_ham_info_from_npy(ase_db_path,
                 pred_ham = _load_npy_safe(pred_ham_filename)
 
                 # 2. Transform Basis (Rotation)
-                # Convention: Transform predicted matrix to PySCF basis order
                 pred_ham_pyscf = matrix_transform(pred_ham, atom_nums, convention=back_convention)
 
                 # 3. Build PySCF Mole & Get Overlap
@@ -448,21 +382,18 @@ def get_ham_info_from_npy(ase_db_path,
                 overlap = mol.intor("int1e_ovlp")
 
                 # 4. Solve for Energies and Coefficients
-                # Uses the helper imported/defined from file 1
+                # Uses imported function from emoles.loss
                 props = get_electronic_properties(
                     mol, ham=pred_ham_pyscf, overlap=overlap, dm=None
                 )
 
-                # Convert to eV if needed, usually properties are in Hartree, let's keep consistent with Loss file which converts later or explicitly. Loss file says "HOMO (eV)": data["HOMO"]. Let's store raw Hartree here or convert.
-                # Usually pyscf returns Hartree. The loss file output format converts to eV.
-                # Here we save Hartree to be safe, or eV if preferred. Let's save eV for ease of reading.
-                homo_ev = props["HOMO"] * 27.2114
-                lumo_ev = props["LUMO"] * 27.2114
-                gap_ev = props["GAP"] * 27.2114
+                # Note: props["HOMO"] etc from loss.py are in Hartree.
+                homo_ev = props["HOMO"] * Hartree
+                lumo_ev = props["LUMO"] * Hartree
+                gap_ev = props["GAP"] * Hartree
 
                 # 5. Draw HOMO / LUMO Cubes
                 if idx < max_cube_save:
-                    # PySCF cubegen needs the specific orbital coefficient vector (N,)
                     homo_coeff = props["HOMO_coefficients"]
                     lumo_coeff = props["LUMO_coefficients"]
 
@@ -501,3 +432,244 @@ def get_ham_info_from_npy(ase_db_path,
 
     second_per_item = (end_time - start_time) / max(1, len(all_ham_info))
     print(f'Hamiltonian Post-process Time (s/item): {second_per_item}')
+
+
+# ==========================================
+# New Pure Inference Entry (DM -> Properties)
+# ==========================================
+
+def dm_infer_entry(
+        abs_ase_path,
+        results_folder_path,
+        dm_filename="predicted.npy",
+        convention="def2svp",
+        mol_charge=0,
+        transform_dm_flag=True,
+        calc_esp_flag=True,
+        calc_electronic_flag=True,
+        save_cube_info=True,
+        n_save_cube_items=5,
+        cube_grid=75,  # [New] Grid resolution for cube generation
+        temp_cube_file="infer_cube_data.pkl",
+        summary_filename="inference_summary.npz",
+        max_items=None,
+):
+    """
+    Pure inference entry point.
+    Loads geometry and predicted DM, calculates properties (Dipole, HOMO/LUMO, ESP),
+    and saves results without calculating loss/metrics against a ground truth.
+    """
+    # 1. Setup Convention
+    if convention == "6311gdp":
+        basis = "6-311+g(d,p)"
+        back_convention = "back_2_thu_pyscf"
+    else:
+        basis = "def2svp"
+        back_convention = "back2pyscf"
+
+    start_time = time.time()
+    summary_data_list = []
+    temp_cube_data = []
+
+    count = 0
+    fail_count = 0
+
+    # Ensure results_folder_path is absolute
+    results_folder_path = os.path.abspath(results_folder_path)
+
+    # 2. Iterate Database
+    with connect(abs_ase_path) as db:
+        # Determine total for tqdm
+        total_rows = db.count() if max_items is None else max_items
+
+        for idx, a_row in tqdm(enumerate(db.select()), total=total_rows):
+            if max_items is not None and idx >= max_items:
+                break
+
+            cwd_ = os.getcwd()
+            work_dir = os.path.join(results_folder_path, f"{idx}")
+
+            # Skip if directory doesn't exist
+            if not os.path.exists(work_dir):
+                continue
+
+            try:
+                os.chdir(work_dir)
+                count += 1
+
+                # --- A. Geometry & Mole Setup ---
+                atom_nums = a_row.numbers
+                an_atoms = a_row.toatoms()
+
+                # Load charge from DB or default
+                current_mol_charge = a_row.data.get("charge", mol_charge)
+                sum_of_atomic_numbers = an_atoms.get_atomic_numbers().sum()
+                total_electrons = sum_of_atomic_numbers - current_mol_charge
+                mol_spin = total_electrons % 2
+
+                mol = pyscf.gto.Mole()
+                t = [
+                    [atom_nums[atom_idx], an_atom.position]
+                    for atom_idx, an_atom in enumerate(an_atoms)
+                ]
+                mol.charge = current_mol_charge
+                mol.spin = mol_spin
+                mol.build(verbose=0, atom=t, basis=basis, unit="ang")
+
+                # --- B. Load Density Matrix ---
+                # Check if dm_filename is a full path or relative
+                if not os.path.isabs(dm_filename):
+                    # Usually just "predicted_dm.npy" in the current dir
+                    load_path = dm_filename
+                else:
+                    load_path = dm_filename
+
+                pred_dm = _load_npy_safe(load_path)
+
+                if transform_dm_flag:
+                    pred_dm = matrix_transform(pred_dm, atom_nums, convention=back_convention)
+
+                # Dictionary to store inferred physical properties
+                props = {
+                    "idx": idx,
+                    "charge": current_mol_charge,
+                    "spin": mol_spin
+                }
+
+                # --- C. Dipole Moment ---
+                # Imported from emoles.pyscf
+                dip_vec = get_dipole_info(mol, pred_dm)  # Returns Debye vector
+                props["dipole_vector"] = dip_vec
+                props["dipole_magnitude"] = np.linalg.norm(dip_vec)
+
+                # --- D. Electronic Structure (HOMO/LUMO/Gap/Electrons) ---
+                overlap = mol.intor("int1e_ovlp")
+
+                # Check electron number conservation (Imported from emoles.loss)
+                ne_pred = get_electron_number_from_dm(pred_dm, overlap)
+                props["Ne_actual"] = float(total_electrons)
+                props["Ne_pred"] = ne_pred
+                props["Ne_error"] = abs(ne_pred - total_electrons)
+
+                electronic_info = None
+                if calc_electronic_flag:
+                    # Uses imported get_electronic_properties from emoles.loss
+                    # Derives Hamiltonian from DM via PySCF to solve for energies
+                    electronic_info = get_electronic_properties(
+                        mol, dm=pred_dm, overlap=overlap
+                    )
+
+                    # Convert Hartree to eV for summary
+                    props["HOMO"] = float(electronic_info["HOMO"] * Hartree)
+                    props["LUMO"] = float(electronic_info["LUMO"] * Hartree)
+                    props["GAP"] = float(electronic_info["GAP"] * Hartree)
+
+                    # [New Logic] Generate HOMO/LUMO Cubes locally
+                    if save_cube_info and idx < n_save_cube_items:
+                        homo_coeff = electronic_info["HOMO_coefficients"]
+                        lumo_coeff = electronic_info["LUMO_coefficients"]
+
+                        # Generate orbital cubes
+                        tools.cubegen.orbital(mol, 'homo.cube', homo_coeff, nx=cube_grid, ny=cube_grid, nz=cube_grid)
+                        tools.cubegen.orbital(mol, 'lumo.cube', lumo_coeff, nx=cube_grid, ny=cube_grid, nz=cube_grid)
+
+                        # Optional: Also generate density cube since we have the DM
+                        tools.cubegen.density(mol, 'pred_density.cube', pred_dm, nx=cube_grid, ny=cube_grid,
+                                              nz=cube_grid)
+
+                # --- E. ESP & Deformation ---
+                if calc_esp_flag:
+                    # Imported from emoles.loss (wraps Multiwfn/Mokit)
+                    # prefix="infer" creates infer.fch
+                    esp_max, esp_min, phi = calculate_properties_from_dm(
+                        mol, pred_dm, prefix="infer", gen_dm_flag=False
+                    )
+                    props["ESP_max_eV"] = esp_max
+                    props["ESP_min_eV"] = esp_min
+                    props["Deformation_phi"] = phi
+
+                # --- F. Save Results ---
+
+                # 1. Individual JSON
+                json_props = {}
+                for k, v in props.items():
+                    if isinstance(v, (np.ndarray, np.generic)):
+                        json_props[k] = v.tolist()
+                    else:
+                        json_props[k] = v
+
+                with open("dm_inference_result.json", "w") as f_json:
+                    json.dump(json_props, f_json, indent=4)
+
+                # 2. Add to summary list
+                summary_data_list.append(props)
+
+                # 3. Cube Info (Optional - for bulk generation later via pickle)
+                # Keep this if you still want the pickle functionality alongside direct generation
+                if save_cube_info and idx < n_save_cube_items and electronic_info is not None:
+                    mol_info = {
+                        "atom_nums": [int(x) for x in atom_nums],
+                        "atom_coords": [list(at.position) for at in an_atoms],
+                        "charge": int(current_mol_charge),
+                        "spin": int(mol_spin),
+                        "basis": basis,
+                        "unit": "ang",
+                    }
+                    cube_item = {
+                        "idx": idx,
+                        "mol_info": mol_info,
+                        "outputs": electronic_info,  # Contains coeffs and occ
+                        "tgt_info": None
+                    }
+                    temp_cube_data.append(cube_item)
+
+            except Exception as e:
+                fail_count += 1
+                traceback.print_exc()
+                print(f"[dm_infer_entry] idx {idx} failed: {repr(e)}")
+            finally:
+                os.chdir(cwd_)
+
+    # 3. Post-Loop Saving
+
+    # Save Cube Pickle (contains wavefunctions for plotting)
+    if save_cube_info and temp_cube_file and len(temp_cube_data) > 0:
+        save_path = os.path.join(results_folder_path, temp_cube_file)
+        try:
+            with open(save_path, "wb") as f:
+                pickle.dump(temp_cube_data, f)
+            print(f"[dm_infer_entry] Saved cube info for {len(temp_cube_data)} items to {save_path}")
+        except Exception as e:
+            print(f"[dm_infer_entry] Failed to save cube data: {e}")
+
+    # Save Summary NPZ
+    if len(summary_data_list) > 0:
+        all_keys = set().union(*(d.keys() for d in summary_data_list))
+        npz_dict = {}
+        for key in all_keys:
+            values = []
+            for item in summary_data_list:
+                val = item.get(key, np.nan)
+                if isinstance(val, (list, np.ndarray)):
+                    values.append(val)
+                elif val is None:
+                    values.append(np.nan)
+                else:
+                    values.append(val)
+
+            try:
+                npz_dict[key] = np.array(values)
+            except:
+                npz_dict[key] = np.array(values, dtype=object)
+
+        np.savez(os.path.join(results_folder_path, summary_filename), **npz_dict)
+        print(f"[dm_infer_entry] Summary saved to {summary_filename}")
+
+    end_time = time.time()
+    total_time = end_time - start_time
+    avg_time = total_time / max(1, count)
+
+    print(f"[dm_infer_entry] Finished. Processed: {count}, Failed: {fail_count}")
+    print(f"Total Time: {total_time:.2f}s, Avg: {avg_time:.4f}s/item")
+
+    return summary_data_list

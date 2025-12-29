@@ -412,15 +412,15 @@ def evaluate_configuration(
 def build_cluster(
         ion_identifier: Union[str, Atoms, Chem.Mol],
         ligand_molecule_info: List[Tuple[Union[str, Atoms, Chem.Mol], int]],
-        relative_score_threshold: float = 0.7,  # used by patch picker for secondary site screening
+        relative_score_threshold: float = 0.75,  # used by patch picker for secondary site screening
         max_patch_atoms: int = 3,
-        initial_sphere_skin_factor: float = 1.0,
-        sphere_skin_increment_factor: float = 0.05,
-        max_sphere_expansions: int = 10,
+        initial_sphere_skin_factor: float = 1.25,
+        sphere_skin_increment_factor: float = 0.1,
+        max_sphere_expansions: int = 6,
         target_no_clashes: bool = True,
-        rotation_opt_iterations: int = 30,
-        rotation_samples_per_ligand: int = 50,
-        initial_ligand_orientation: str = "random",  # 'random' or 'aligned_to_ion'
+        rotation_opt_iterations: int = 50,
+        rotation_samples_per_ligand: int = 80,
+        initial_ligand_orientation: str = "aligned_to_ion",  # 'random' or 'aligned_to_ion'
         verbose: bool = True,
 ) -> Atoms:
     """
@@ -536,26 +536,15 @@ def build_cluster(
 if __name__ == "__main__":
     # Example 1: SMILES-only workflow
     # ec = "C1COC(=O)O1"  # Ethylene carbonate (EC)
-    ec = "COCCOC"  # DME
     # ec = 'COCCOCC(F)F'  # DMC
     # fsi = "N#CC1=C(C#N)[N-]C(C(F)(F)F)=N1"  # Bis(fluorosulfonyl)imide (FSI)
-    fsi = "[B-](F)(F)(F)(F)"  # Bis(fluorosulfonyl)imide (FSI)
-
+    # fsi = "[B-](F)(F)(F)(F)"  # Bis(fluorosulfonyl)imide (FSI)
+    dme = "COCCOC"  # DME
     # CHANGED: Using a list of tuples instead of a dictionary
     cluster1 = build_cluster(
         ion_identifier="Li",
-        ligand_molecule_info=[(ec, 1)],
-        # ligand_molecule_info=[(ec, 2), (fsi, 1)],
-        relative_score_threshold=0.75,
-        max_patch_atoms=3,
-        initial_sphere_skin_factor=1.25,
-        sphere_skin_increment_factor=0.10,
-        max_sphere_expansions=6,
-        target_no_clashes=True,
-        rotation_opt_iterations=50,
-        rotation_samples_per_ligand=80,
-        initial_ligand_orientation="aligned_to_ion",
-        verbose=True,
+        ligand_molecule_info=[(dme, 1)],
+        # ligand_molecule_info=[(ec, 1), (fsi, 1)],
     )
     write("Li_1DME_cluster.xyz", cluster1)
     print("Wrote Li_2EC_1TDI_cluster.xyz")

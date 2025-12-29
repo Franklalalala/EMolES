@@ -236,11 +236,12 @@ def _calculate_score(atom: Chem.Atom, charge: float) -> float:
     # 3. 优化打印信息：将所有相关信息格式化后在一行内打印
     #    - {symbol:<2} 表示原子符号占2个字符宽度，左对齐
     #    - {:6.3f} 表示浮点数占6个字符宽度，保留3位小数
-    print(
-        f"Atom: {symbol:<2} | "
-        f"Scores -> Charge: {charge_score:6.3f}, HSAB: {hsab_score:6.3f}, Steric: {steric_score:6.3f} | "
-        f"Total: {total_score:7.3f}"
-    )
+
+    # print(
+    #     f"Atom: {symbol:<2} | "
+    #     f"Scores -> Charge: {charge_score:6.3f}, HSAB: {hsab_score:6.3f}, Steric: {steric_score:6.3f} | "
+    #     f"Total: {total_score:7.3f}"
+    # )
 
 
     return (WEIGHTS["charge"] * charge_score +
@@ -332,8 +333,8 @@ def _pair_synergy(mol: Chem.Mol, a_idx: int, b_idx: int) -> float:
     w_st = SYNERGY_WEIGHTS["steric"]
     w_an = SYNERGY_WEIGHTS["angle"]
     s = w_st * (s_steric ** 0.2) + w_an * (s_angle ** 0.2)
-    print(f'angle: {s_angle}')
-    print(f'steric: {s_steric}')
+    # print(f'angle: {s_angle}')
+    # print(f'steric: {s_steric}')
 
     return float(np.clip(s, 0.0, 1.0))
 
@@ -409,7 +410,7 @@ def _select_subsequent_sites(
       - Accept only the single best candidate if penalized_score >= primary_score * threshold
       - Stop when no candidate satisfies the threshold or 'max_extra' is reached
     """
-    verbose = True
+    # verbose = True
 
     chosen: List[int] = []
     # 修复：创建 selected 的本地副本，而不是直接修改传入的列表
@@ -432,9 +433,9 @@ def _select_subsequent_sites(
 
         # Pick the best by penalized score (descending)
         candidates.sort(key=lambda x: x[3], reverse=True)
-        print(candidates)
-        print(candidates[0])
-        print(threshold * primary_score)
+        # print(candidates)
+        # print(candidates[0])
+        # print(threshold * primary_score)
         top_idx, top_base, top_syn, top_eff = candidates[0]
 
         # Threshold relative to the primary base score
@@ -484,7 +485,7 @@ def get_patch_atoms_and_indices(
         max_patch_atoms: max number of sites to return
         verbose: print details
     """
-    verbose = True
+    # verbose = True
     # Handle simple ions
     if isinstance(identifier, str) and identifier.upper() in SIMPLE_IONS:
         sym = SIMPLE_IONS[identifier.upper()]

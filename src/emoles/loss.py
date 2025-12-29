@@ -277,7 +277,7 @@ def cal_orbital_and_energies(overlap_matrix, full_hamiltonian):
 def post_processing(batch, default_type=np.float32):
     for key in batch.keys():
         if isinstance(batch[key], np.ndarray) and np.issubdtype(
-            batch[key].dtype, np.floating
+                batch[key].dtype, np.floating
         ):
             batch[key] = batch[key].astype(default_type)
     return batch
@@ -303,6 +303,11 @@ def process_dm_loss_dict(data, key="pred_vs_label"):
     # --- 1. 基础 DM & Dipole 指标 ---
     if "density_matrix" in data:
         processed["Density-Matrix-MAE"] = data["density_matrix"]
+    if "diagonal_density_matrix_mae" in data:
+        processed["Diag-DM-MAE"] = data["diagonal_density_matrix_mae"]
+    if "non_diagonal_density_matrix_mae" in data:
+        processed["NonDiag-DM-MAE"] = data["non_diagonal_density_matrix_mae"]
+
     if "dipole" in data:
         processed["Dipole-Moment-MAE-Debye"] = data["dipole"]
 
@@ -320,6 +325,10 @@ def process_dm_loss_dict(data, key="pred_vs_label"):
     # Hamiltonian MAE
     if "hamiltonian" in data:
         processed["Ham-MAE (1e-6 Ha)"] = data["hamiltonian"] * 1e6
+    if "diagonal_hamiltonian_mae" in data:
+        processed["Diag-Ham-MAE (1e-6 Ha)"] = data["diagonal_hamiltonian_mae"] * 1e6
+    if "non_diagonal_hamiltonian_mae" in data:
+        processed["NonDiag-Ham-MAE (1e-6 Ha)"] = data["non_diagonal_hamiltonian_mae"] * 1e6
 
     # Orbital Energies (HOMO/LUMO/GAP)
     if "HOMO" in data:
@@ -368,7 +377,7 @@ def process_dm_loss_dict(data, key="pred_vs_label"):
 
 
 def get_electronic_properties(
-    mol, ham=None, overlap=None, dm=None, shifted_ham=None
+        mol, ham=None, overlap=None, dm=None, shifted_ham=None
 ):
     """
     Helper function to extract electronic properties (Energies, Orbitals, Gap)
@@ -464,21 +473,21 @@ def get_electron_number_from_dm(dm, overlap):
 
 
 def evaluate_dm_from_npy(
-    abs_ase_path,
-    npy_folder_path,
-    convention="def2svp",
-    mol_charge=0,
-    pred_dm_filename="predicted_dm.npy",
-    target_dm_filename="target_dm.npy",
-    transform_dm_flag=True,
-    get_esp_sta_flag=True,
-    get_ham_flag=True,
-    keep_xyz_file=True,
-    n_save_cube_items: int = 5,  # 新增：专门用于 generate_cube_files 的保存数量
-    temp_data_file: str = "temp_cube_data.pkl",  # 新增：保存路径
-    max_items: int = 300,
-    dm_grid: int = 40,
-    summary_filename="evaluation_summary.npz",
+        abs_ase_path,
+        npy_folder_path,
+        convention="def2svp",
+        mol_charge=0,
+        pred_dm_filename="predicted_dm.npy",
+        target_dm_filename="target_dm.npy",
+        transform_dm_flag=True,
+        get_esp_sta_flag=True,
+        get_ham_flag=True,
+        keep_xyz_file=True,
+        n_save_cube_items: int = 5,  # 新增：专门用于 generate_cube_files 的保存数量
+        temp_data_file: str = "temp_cube_data.pkl",  # 新增：保存路径
+        max_items: int = 300,
+        dm_grid: int = 40,
+        summary_filename="evaluation_summary.npz",
 ):
     import time
     import json
@@ -568,6 +577,21 @@ def evaluate_dm_from_npy(
                 # 1. 基础误差 (Density Matrix & Dipole)
                 errors = calculate_dm_dipole_mae(pred_dm, target_dm, mol)
 
+                # --- NEW: Calculate Block Diagonal/Non-Diagonal MAE for Density Matrix ---
+                _, atom_in_mo_indices = generate_molecule_transform_indices(
+                    atom_types=an_atoms.get_chemical_symbols(),
+                    atom_to_transform_indices=atom_to_transform_indices,
+                )
+                # Recalculate diff locally to split it
+                dm_diff = np.abs(pred_dm - target_dm)
+                dm_diag, dm_non_diag = cut_and_cal_matrix(
+                    full_matrix=dm_diff,
+                    atom_in_mo_indices=atom_in_mo_indices
+                )
+                errors["diagonal_density_matrix_mae"] = dm_diag
+                errors["non_diagonal_density_matrix_mae"] = dm_non_diag
+                # -----------------------------------------------------------------------
+
                 # 1b. 新增：电子数守恒相关误差
                 errors["pred_electron_number_error"] = abs(Ne_pred - expected_electrons)
                 errors["target_electron_number_error"] = abs(
@@ -576,7 +600,6 @@ def evaluate_dm_from_npy(
                 errors["electron_number_pred_vs_target_error"] = abs(
                     Ne_pred - Ne_target
                 )
-
 
                 # 2. (可选) 计算 DM 推导出的 Hamiltonian 误差及轨道相似度
                 if get_ham_flag:
@@ -597,6 +620,8 @@ def evaluate_dm_from_npy(
                         "LUMO_coefficients",
                     ]
 
+                    # Note: criterion will handle diagonal/non-diagonal for hamiltonian
+                    # because we pass 'atoms=an_atoms' and key 'hamiltonian' is in eval_keys.
                     ham_orb_errors = criterion(
                         pred_props,
                         target_props,
@@ -653,7 +678,7 @@ def evaluate_dm_from_npy(
                 for key, val in errors.items():
                     if val is not None:
                         total_error_dict["pred_vs_label"][key] = (
-                            total_error_dict["pred_vs_label"].get(key, 0.0) + val
+                                total_error_dict["pred_vs_label"].get(key, 0.0) + val
                         )
 
                 total_error_dict["total_items"] += 1
@@ -731,12 +756,12 @@ def evaluate_dm_from_npy(
 
 
 def prepare_np(
-    overlap_matrix,
-    full_hamiltonian,
-    atom_symbols,
-    transform_ham_flag=False,
-    transform_overlap_flag=False,
-    convention="def2svp",
+        overlap_matrix,
+        full_hamiltonian,
+        atom_symbols,
+        transform_ham_flag=False,
+        transform_overlap_flag=False,
+        convention="def2svp",
 ):
     if convention == "6311gdp":
         back_convention = "back_2_thu_pyscf"
@@ -757,14 +782,14 @@ def prepare_np(
 
 
 def get_mae_from_npy(
-    abs_ase_path,
-    npy_folder_path,
-    temp_data_file=None,
-    united_overlap_flag=False,
-    convention="def2svp",
-    mol_charge=0,
-    save_summary=False,
-    full_save_items=10,
+        abs_ase_path,
+        npy_folder_path,
+        temp_data_file=None,
+        united_overlap_flag=False,
+        convention="def2svp",
+        mol_charge=0,
+        save_summary=False,
+        full_save_items=10,
 ):
     import pickle
 
@@ -888,7 +913,7 @@ def get_mae_from_npy(
             )
             for key, val in pred_vs_label.items():
                 total_error_dict["pred_vs_label"][key] = (
-                    total_error_dict["pred_vs_label"].get(key, 0.0) + val
+                        total_error_dict["pred_vs_label"].get(key, 0.0) + val
                 )
 
             if save_summary:
@@ -914,7 +939,7 @@ def get_mae_from_npy(
     if n > 0:
         for key in total_error_dict["pred_vs_label"].keys():
             total_error_dict["pred_vs_label"][key] = (
-                total_error_dict["pred_vs_label"][key] / n
+                    total_error_dict["pred_vs_label"][key] / n
             )
 
     end_time = time.time()
