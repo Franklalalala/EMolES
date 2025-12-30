@@ -102,30 +102,37 @@ def entry(
         max_steps: int = 200,
         verbose: bool = False,
         show_progress: bool = True
-):
+) -> str:
+    """
+    Main optimization routine.
+    Returns: Path to the output database.
+    """
     # 1. Path Setup & Cleanup
     traj_dir = os.path.join(workspace, 'traj')
     out_xyz_dir = os.path.join(workspace, 'optimized_xyz_all')
     out_db_path = os.path.join(workspace, 'optimized_all.db')
 
     # Cleanup: Remove old outputs to ensure a fresh run
+    # Note: If reusing workspace for multiple steps, be careful.
+    # Here we assume entry() controls its specific workspace folder.
     if os.path.exists(out_db_path):
-        print(f"Removing existing output DB: {out_db_path}")
+        if verbose: print(f"Removing existing output DB: {out_db_path}")
         os.remove(out_db_path)
 
     for d in [traj_dir, out_xyz_dir]:
         if os.path.exists(d):
-            print(f"Cleaning existing directory: {d}")
             shutil.rmtree(d)
         os.makedirs(d, exist_ok=True)
 
     # 2. Prepare Input Source (DB or SMILES->DB)
     active_input_db = prepare_input_source(workspace, input_db, smiles)
 
-    print(f"Workdir: {workspace}\nInput: {active_input_db}\nOutput: {out_db_path}")
+    if verbose:
+        print(f"Workdir: {workspace}\nInput: {active_input_db}\nOutput: {out_db_path}")
 
     # 3. Model Loading
-    print("Loading FAIRChem model...")
+    if verbose: print("Loading FAIRChem model...")
+    # Ensure atom_refs cache is in the workspace or a temp loc to avoid permission issues
     atom_refs = get_isolated_atomic_energies(DEFAULT_MODEL_NAME, workspace)
     predictor = load_predict_unit(checkpoint_path, "default", None, device, atom_refs)
     calc = FAIRChemCalculator(predictor, task_name="omol")
@@ -146,11 +153,21 @@ def entry(
 
             # --- Core Logic: Charge Calculation & Type Enforcing ---
             try:
-                # Default n_anion to 0 if missing
-                n_anion = int(float(kvp.get('n_anion', 0)))
-                # Charge = 1 (Li) - N_Anions * 1
-                charge = int(1 - n_anion)
-                spin = int(1)
+                # 1. Try to read charge/spin directly
+                if 'charge' in kvp:
+                    charge = int(float(kvp['charge']))
+                elif 'n_anion' in kvp:
+                    # Heuristic for cluster: Charge = 1 (Li) - N_Anions * 1
+                    n_anion = int(float(kvp['n_anion']))
+                    charge = int(1 - n_anion)
+                else:
+                    # Default: assume neutral or +1 based on context?
+                    # For safety in this specific Lithium context, default to +1 (often solvated Li)
+                    # unless it looks like a pure anion.
+                    charge = 1
+
+                spin = int(kvp.get('spin', 1))  # Default spin doublet for Li+ systems
+
             except Exception:
                 # Fallback safety
                 charge, spin = 1, 1
@@ -177,10 +194,10 @@ def entry(
 
             try:
                 # Logfile control: '-' for stdout, None for silence
-                logfile = '-' if verbose else None
+                logfile = '-' if (verbose and not show_progress) else None
 
                 if verbose and show_progress:
-                    tqdm.write(f"\n--- Opt: {base_name} (Q={charge}, Steps={max_steps}) ---")
+                    tqdm.write(f"--- Opt: {base_name} (Q={charge}) ---")
 
                 opt = LBFGS(atoms, trajectory=traj_path, logfile=logfile)
                 opt.run(fmax=fmax, steps=max_steps)
@@ -190,7 +207,7 @@ def entry(
                 write(out_xyz, atoms)
 
                 atoms.calc = None  # Clean up calculator before saving to DB
-                tgt_db.write(atoms, data=kvp)
+                tgt_db.write(atoms, data=kvp, **kvp)
 
             except Exception as e:
                 msg = f"[Error] {base_name}: {e}"
@@ -199,7 +216,7 @@ def entry(
                 else:
                     print(msg)
 
-    print("\nAll tasks completed.")
+    return out_db_path
 
 
 def main():
@@ -221,7 +238,7 @@ def main():
 
     args = parser.parse_args()
 
-    entry(
+    out_path = entry(
         input_db=args.input_db,
         smiles=args.smiles,
         workspace=args.workspace,
@@ -232,6 +249,8 @@ def main():
         verbose=args.verbose,
         show_progress=args.progress
     )
+
+    print(f"\nOptimization finished. Output DB: {out_path}")
 
 
 if __name__ == "__main__":
