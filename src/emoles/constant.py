@@ -91,6 +91,32 @@ convention_dict = {
             8: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 9: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
         },
     ),
+    'thu_cluster': Namespace(
+        atom_to_orbitals_map={
+            1: 'ssp', 3: 'ssspp', 5: 'sssppd', 6: 'sssppd', 7: 'sssppd',
+            8: 'sssppd', 9: 'sssppd', 15: 'sssspppd', 16: 'sssspppd'
+        },
+        orbital_idx_map={'s': [0], 'p': [1, 2, 0], 'd': [0, 1, 2, 3, 4]},
+        orbital_sign_map={'s': [1], 'p': [1, 1, 1], 'd': [1, 1, 1, 1, 1]},
+        orbital_order_map={
+            1: [0, 1, 2], 3: [0, 1, 2, 3, 4], 5: [0, 1, 2, 3, 4, 5],
+            6: [0, 1, 2, 3, 4, 5], 7: [0, 1, 2, 3, 4, 5], 8: [0, 1, 2, 3, 4, 5],
+            9: [0, 1, 2, 3, 4, 5], 15: [0, 1, 2, 3, 4, 5, 6, 7], 16: [0, 1, 2, 3, 4, 5, 6, 7]
+        },
+    ),
+    'back_thu_cluster': Namespace(
+        atom_to_orbitals_map={
+            1: 'ssp', 3: 'ssspp', 5: 'sssppd', 6: 'sssppd', 7: 'sssppd',
+            8: 'sssppd', 9: 'sssppd', 15: 'sssspppd', 16: 'sssspppd'
+        },
+        orbital_idx_map={'s': [0], 'p': [0, 1, 2], 'd': [0, 1, 2, 3, 4]},
+        orbital_sign_map={'s': [1], 'p': [1, 1, 1], 'd': [1, 1, 1, 1, 1]},
+        orbital_order_map={
+            1: [0, 1, 2], 3: [0, 1, 2, 3, 4], 5: [0, 1, 2, 3, 4, 5],
+            6: [0, 1, 2, 3, 4, 5], 7: [0, 1, 2, 3, 4, 5], 8: [0, 1, 2, 3, 4, 5],
+            9: [0, 1, 2, 3, 4, 5], 15: [0, 1, 2, 3, 4, 5, 6, 7], 16: [0, 1, 2, 3, 4, 5, 6, 7]
+        },
+    ),
 }
 
 atomrefs = {

@@ -13,7 +13,7 @@ from pyscf.scf.hf import make_rdm1
 from pyscf import gto, dft, tools
 from tqdm import tqdm
 from emoles.pyscf import generate_cube_files, get_dipole_info
-from emoles.constant import atom_to_transform_indices
+from emoles.constant import atom_to_transform_indices, convention_dict
 from emoles.utils import (
     cut_and_cal_matrix,
     format_number,
@@ -506,6 +506,9 @@ def evaluate_dm_from_npy(
     if convention == "6311gdp":
         basis = "6-311+g(d,p)"
         back_convention = "back_2_thu_pyscf"
+    elif convention == "back_thu_cluster":
+        basis = "def2svp"
+        back_convention = convention
     else:
         basis = "def2svp"
         back_convention = "back2pyscf"
@@ -954,3 +957,165 @@ def get_mae_from_npy(
             pickle.dump(temp_data, f)
 
     return total_error_dict
+
+
+
+from itertools import permutations
+from types import SimpleNamespace
+
+
+def find_best_dm_transform_permutation(
+        abs_ase_path,
+        npy_folder_path,
+        dm_filename="predicted_dm.npy",
+        basis_set="def2svp",
+        n_test_items=5,
+        base_convention="back2pyscf"  # 作为模板的基础配置，包含 atom_to_orbitals_map 等
+):
+    """
+    轻量级测试函数：遍历 P 和 D 轨道的索引排列，寻找使电子数误差 (Tr(PS) - Ne) 最小的变换方案。
+    """
+    import numpy as np
+    from pyscf import gto
+    from ase.db import connect
+    from tqdm import tqdm
+
+    # 1. 准备排列组合
+    p_perms = list(permutations([0, 1, 2]))
+    d_perms = list(permutations([0, 1, 2, 3, 4]))
+
+    # 存储每种 (p_idx, d_idx) 组合的累计误差
+    # key: (tuple_p, tuple_d), value: cumulative_error
+    permutation_errors = {}
+
+    # 初始化所有组合的误差为 0
+    for p in p_perms:
+        for d in d_perms:
+            permutation_errors[(p, d)] = 0.0
+
+    print(f"--- Starting Permutation Search ---")
+    print(f"Testing {len(p_perms) * len(d_perms)} combinations on {n_test_items} molecules...")
+
+    # 2. 遍历分子
+    valid_items = 0
+    with connect(abs_ase_path) as db:
+        for idx, row in tqdm(enumerate(db.select()), total=n_test_items):
+            if valid_items >= n_test_items:
+                break
+
+            # 加载 DM
+            folder = os.path.join(npy_folder_path, str(idx))
+            dm_path = os.path.join(folder, dm_filename)
+            if not os.path.exists(dm_path):
+                continue
+
+            try:
+                # 原始数据
+                orig_dm = np.load(dm_path)
+                atom_nums = row.numbers
+                coords = row.toatoms().positions
+                charge = row.data.get("charge", 0)
+
+                # 构建 PySCF 分子以获取重叠矩阵 S
+                mol = gto.M(
+                    atom=[(atom_nums[i], coords[i]) for i in range(len(atom_nums))],
+                    basis=basis_set,
+                    charge=charge,
+                    spin=(sum(atom_nums) - charge) % 2,
+                    unit='Ang',
+                    verbose=0
+                )
+                overlap = mol.intor("int1e_ovlp")
+                target_ne = float(mol.nelectron)
+
+                # 3. 核心循环：测试每种排列
+                # 我们需要临时修改全局 convention_dict 或传入一个新的 key
+                # 这里我们利用 base_convention 作为模板
+                template_conf = convention_dict[base_convention]
+
+                # 临时 key
+                temp_key = "temp_perm_search"
+
+                for p_idx in p_perms:
+                    for d_idx in d_perms:
+                        # 构造新的 Namespace 配置
+                        new_conf = SimpleNamespace(
+                            atom_to_orbitals_map=template_conf.atom_to_orbitals_map,
+                            orbital_sign_map=template_conf.orbital_sign_map,
+                            orbital_order_map=template_conf.orbital_order_map,
+                            # 关键：在这里应用当前的排列
+                            orbital_idx_map={
+                                's': [0],
+                                'p': list(p_idx),
+                                'd': list(d_idx)
+                            }
+                        )
+
+                        # 注入全局字典 (matrix_transform 依赖全局 convention_dict)
+                        convention_dict[temp_key] = new_conf
+
+                        # 执行变换
+                        transformed_dm = matrix_transform(orig_dm, atom_nums, convention=temp_key)
+
+                        # 计算电子数 Ne = Tr(P @ S)
+                        # 注意 transformed_dm 可能是 (1, N, N) 或 (N, N)
+                        if transformed_dm.ndim == 3:
+                            dm_2d = transformed_dm[
+                                0]  # RKS/spin-sum usually done externally, but taking first dim if structure matches
+                            # 如果是 spin separated (2, N, N), 应该 sum(axis=0)，视你的数据格式而定
+                            # 假设输入是 RKS 或已处理过的 DM
+                            if transformed_dm.shape[0] == 2:
+                                dm_2d = np.sum(transformed_dm, axis=0)
+                        else:
+                            dm_2d = transformed_dm
+
+                        ne_calc = np.einsum('ij,ji->', dm_2d, overlap)
+
+                        # 累加绝对误差
+                        error = abs(ne_calc - target_ne)
+                        permutation_errors[(p_idx, d_idx)] += error
+
+                valid_items += 1
+
+            except Exception as e:
+                print(f"Skipping idx {idx} due to error: {e}")
+                continue
+
+    # 4. 寻找最佳结果
+    if valid_items == 0:
+        print("No valid items processed.")
+        return
+
+    best_combo = min(permutation_errors, key=permutation_errors.get)
+    best_p, best_d = best_combo
+    min_error = permutation_errors[best_combo] / valid_items
+
+    print("\n" + "=" * 50)
+    print(f"  SEARCH COMPLETE")
+    print("=" * 50)
+    print(f"Best Avg Electron Error: {min_error:.2e}")
+    print(f"Best P-permutation: {list(best_p)}")
+    print(f"Best D-permutation: {list(best_d)}")
+    print("-" * 50)
+    print("Suggested Convention Dict Entry:\n")
+
+    # 格式化输出 Python 代码
+    print(f"'best_found_convention': Namespace(")
+    print(f"    atom_to_orbitals_map={template_conf.atom_to_orbitals_map},")
+    print(f"    orbital_idx_map={{'s': [0], 'p': {list(best_p)}, 'd': {list(best_d)}}},")
+    print(f"    orbital_sign_map={template_conf.orbital_sign_map},")
+    print(f"    orbital_order_map={template_conf.orbital_order_map}")
+    print(f"),")
+    print("=" * 50)
+
+    # 清理临时 key
+    if "temp_perm_search" in convention_dict:
+        del convention_dict["temp_perm_search"]
+
+# 使用示例 (请根据实际路径调用):
+# find_best_dm_transform_permutation(
+#     abs_ase_path="path/to/test.db",
+#     npy_folder_path="path/to/npy",
+#     basis_set="def2svp",  # 或 "6-311+g(d,p)"
+#     base_convention="back2pyscf" # 选择一个原子轨道结构(ssp vs sssp)与你目标一致的作为模板
+# )
