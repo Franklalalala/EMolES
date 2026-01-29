@@ -17,46 +17,94 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 from emoles.multiwfn import ESPCalculator
 from rdkit.Chem.rdDetermineBonds import DetermineBonds
+import torch
 from collections import defaultdict
 
 
 def extract_model_params(model):
     """
-    从 dptb 模型中提取 basis 和 r_max 参数，并转换为易读的格式。
+    从 dptb 模型中提取 basis 和 r_max 参数。
+    包含 Debug 信息打印，并兼容 r_max 为统一标量的情况。
     """
 
-    # 1. 处理 r_max (Tensor -> float)
-    # model.embedding.init_layer.r_max_dict
-    raw_r_max = model.embedding.init_layer.r_max_dict
-    r_max_clean = {}
+    print("\n" + "=" * 20 + " DEBUG: Model Params Inspection " + "=" * 20)
 
-    for elem, tensor_val in raw_r_max.items():
-        # .item() 将单元素 tensor 转换为 Python 原生 float
-        val = tensor_val.item()
-        r_max_clean[elem] = val
+    # --- Debug: 检查 Embedding 层 ---
+    if hasattr(model, 'embedding'):
+        embed = model.embedding
+        print(f"[INFO] model.embedding type: {type(embed)}")
+        print(f"[INFO] model.embedding keys/vars: {list(embed.__dict__.keys())}")
 
-    # 2. 处理 basis (List of strings -> Dense string "3s2p1d")
-    # model.embedding.basis
-    raw_basis = model.embedding.basis
+        if hasattr(embed, 'basis'):
+            print(f"[INFO] found 'basis' in embedding: {embed.basis}")
+        else:
+            print("[WARN] 'basis' NOT found in embedding attributes!")
+    else:
+        print("[ERROR] Model has no attribute 'embedding'")
+        return {}, {}
+
+    # --- Debug: 检查 InitLayer 层 ---
+    if hasattr(model.embedding, 'init_layer'):
+        init_layer = model.embedding.init_layer
+        print(f"[INFO] init_layer type: {type(init_layer)}")
+        print(f"[INFO] init_layer keys/vars: {list(init_layer.__dict__.keys())}")
+
+        # 重点检查 r_max 相关的属性
+        r_max_scalar = getattr(init_layer, 'r_max', None)
+        r_max_dict = getattr(init_layer, 'r_max_dict', None)
+
+        print(f"[INFO] init_layer.r_max (scalar/tensor): {r_max_scalar}")
+        print(f"[INFO] init_layer.r_max_dict (dict/None): {r_max_dict}")
+    else:
+        print("[ERROR] model.embedding has no attribute 'init_layer'")
+        return {}, {}
+
+    print("=" * 60 + "\n")
+
+    # ================= 提取逻辑开始 =================
+
+    # 1. 处理 basis (List of strings -> Dense string "3s2p1d")
+    raw_basis = getattr(model.embedding, 'basis', {})
     basis_clean = {}
-    orbital_types = ['s', 'p', 'd', 'f']  # 定义顺序
+    orbital_types = ['s', 'p', 'd', 'f']
 
     for elem, orb_list in raw_basis.items():
-        # 统计每种轨道的数量
         counts = defaultdict(int)
         for orb in orb_list:
-            # 假设轨道字符串格式为 "1s", "2p" 等，最后一个字符是轨道类型
-            o_type = orb[-1]
-            counts[o_type] += 1
+            # 假设轨道格式为 "1s", "2p" 等，取最后一个字符
+            if orb:
+                o_type = orb[-1]
+                counts[o_type] += 1
 
-        # 构建稠密字符串
         dense_str = ""
         for o_type in orbital_types:
             count = counts[o_type]
             if count > 0:
                 dense_str += f"{count}{o_type}"
-
         basis_clean[elem] = dense_str
+
+    # 2. 处理 r_max (兼容 scalar 和 dict)
+    # 重新获取引用，以防上面 debug 代码块作用域问题
+    init_layer = model.embedding.init_layer
+    raw_r_max_dict = getattr(init_layer, 'r_max_dict', None)
+    raw_r_max_scalar = getattr(init_layer, 'r_max', None)
+
+    r_max_clean = {}
+
+    if raw_r_max_dict is not None:
+        # 情况 A: r_max_dict 存在 (说明不同元素有不同 r_max)
+        for elem, tensor_val in raw_r_max_dict.items():
+            r_max_clean[elem] = tensor_val.item()
+
+    elif raw_r_max_scalar is not None:
+        # 情况 B: r_max_dict 为 None (说明使用了统一的 r_max)
+        # 此时我们需要根据 basis 中的元素列表，赋予每个元素相同的 r_max
+        scalar_val = raw_r_max_scalar.item()
+        for elem in basis_clean.keys():
+            r_max_clean[elem] = scalar_val
+
+    else:
+        print("[ERROR] Both r_max and r_max_dict are missing in InitLayer!")
 
     return basis_clean, r_max_clean
 

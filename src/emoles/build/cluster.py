@@ -1,6 +1,7 @@
 from typing import List, Tuple, Dict, Union
 import numpy as np
 import random
+import os  # NEW: for directory handling
 
 from ase import Atoms
 from ase.io import read, write
@@ -322,9 +323,12 @@ def optimize_ligand_orientations(
         rotation_opt_iterations: int,
         rotation_samples_per_ligand: int,
         verbose: bool,
+        debug_save_dir: str = None,  # NEW: Argument to specify debug output directory
+        current_sphere_attempt: int = 0  # NEW: To label the step correctly
 ) -> List[Atoms]:
     """
     Stochastic orientation optimization by random local rotations around each ligand’s patch centroid.
+    MODIFIED: In verbose mode with debug_save_dir, saves intermediate structures every 3 iterations.
     """
     total = len(ligands)
     for rot_iter in range(rotation_opt_iterations):
@@ -362,6 +366,16 @@ def optimize_ligand_orientations(
             if best_score < base_score - 1e-6:
                 improvements += 1
             ligands[idx] = best_local
+
+        # NEW: Save intermediate step configuration every 3rd "small step"
+        if verbose and debug_save_dir and (rot_iter + 1) % 3 == 0:
+            step_snapshot = ion_atoms.copy()
+            for lig in ligands:
+                step_snapshot.extend(lig)
+            step_filename = os.path.join(debug_save_dir, f"step_{current_sphere_attempt + 1}_rot_{rot_iter + 1}.xyz")
+            write(step_filename, step_snapshot)
+            # Optional: Uncomment if too spammy
+            # print(f"    [DEBUG] Saved rotation step {rot_iter + 1} to: {step_filename}")
 
         if verbose and (rot_iter % 10 == 0 or rot_iter == rotation_opt_iterations - 1 or improvements == 0):
             rep_sum_no_clash = 0.0
@@ -416,12 +430,13 @@ def build_cluster(
         max_patch_atoms: int = 3,
         initial_sphere_skin_factor: float = 1.25,
         sphere_skin_increment_factor: float = 0.1,
-        max_sphere_expansions: int = 6,
+        max_sphere_expansions: int = 20,
         target_no_clashes: bool = True,
         rotation_opt_iterations: int = 50,
         rotation_samples_per_ligand: int = 80,
         initial_ligand_orientation: str = "aligned_to_ion",  # 'random' or 'aligned_to_ion'
         verbose: bool = True,
+        debug_save_dir: str = None,  # NEW: Argument to specify debug output directory
 ) -> Atoms:
     """
     Build a cluster: ion + multiple ligands.
@@ -442,6 +457,13 @@ def build_cluster(
         total_ligs = sum(count for _, count in ligand_molecule_info)
         print(f"--- Cluster Build Initiated: {str(ion_identifier)} + {total_ligs} Ligands ---")
         print(f"  Using DEFAULT_CLASH_FACTOR (from CombineMols3D): {DEFAULT_CLASH_FACTOR}")
+        if debug_save_dir:
+            print(f"  Debug output enabled. Saving intermediate steps to: {debug_save_dir}")
+
+    # Prepare Debug Directory if needed
+    if verbose and debug_save_dir:
+        if not os.path.exists(debug_save_dir):
+            os.makedirs(debug_save_dir, exist_ok=True)
 
     # Ion prepared via patch picker; for simple ions, patch = [0]
     ase_ion, ion_center, ion_symbol = prepare_ion(
@@ -481,6 +503,7 @@ def build_cluster(
         )
 
         # Orientation optimization
+        # MODIFIED: Pass debug args to inner loop
         placed = optimize_ligand_orientations(
             ion_atoms=ase_ion,
             ligands=placed,
@@ -488,6 +511,8 @@ def build_cluster(
             rotation_opt_iterations=rotation_opt_iterations,
             rotation_samples_per_ligand=rotation_samples_per_ligand,
             verbose=verbose,
+            debug_save_dir=debug_save_dir,
+            current_sphere_attempt=attempt
         )
 
         # Evaluate configuration
@@ -540,14 +565,20 @@ if __name__ == "__main__":
     # fsi = "N#CC1=C(C#N)[N-]C(C(F)(F)F)=N1"  # Bis(fluorosulfonyl)imide (FSI)
     # fsi = "[B-](F)(F)(F)(F)"  # Bis(fluorosulfonyl)imide (FSI)
     dme = "COCCOC"  # DME
+
+    # Specify a directory for debug steps
+    debug_dir = "debug_steps_output"
+
     # CHANGED: Using a list of tuples instead of a dictionary
     cluster1 = build_cluster(
         ion_identifier="Li",
-        ligand_molecule_info=[(dme, 1)],
+        ligand_molecule_info=[(dme, 4)],
         # ligand_molecule_info=[(ec, 1), (fsi, 1)],
+        verbose=True,
+        debug_save_dir=debug_dir  # Pass the directory here
     )
     write("Li_1DME_cluster.xyz", cluster1)
-    print("Wrote Li_2EC_1TDI_cluster.xyz")
+    print("Wrote Li_1DME_cluster.xyz")
 
     # # Example 2: Mixed SMILES and XYZ path
     # # Replace 'methanol.xyz' with a real path on your machine
@@ -578,7 +609,7 @@ if __name__ == "__main__":
     # CHANGED: Using a list of tuples to avoid the unhashable type error
     cluster3 = build_cluster(
         ion_identifier="Na",
-        ligand_molecule_info=[(water_atoms, 2), (ec, 1)],  # mix of ASE Atoms and SMILES
+        ligand_molecule_info=[(water_atoms, 2)],  # mix of ASE Atoms and SMILES
         relative_score_threshold=0.7,
         max_patch_atoms=2,
         initial_sphere_skin_factor=1.2,
@@ -589,6 +620,7 @@ if __name__ == "__main__":
         rotation_samples_per_ligand=60,
         initial_ligand_orientation="random",
         verbose=True,
+        debug_save_dir="debug_Na_steps"
     )
     write("Na_2H2O_1EC_cluster.xyz", cluster3)
     print("Wrote Na_2H2O_1EC_cluster.xyz")

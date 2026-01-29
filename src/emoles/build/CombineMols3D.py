@@ -8,7 +8,7 @@ from ase.neighborlist import build_neighbor_list, natural_cutoffs
 from scipy.spatial import distance_matrix
 
 # --- Global Parameters ---
-DEFAULT_CLASH_FACTOR = 1.25
+DEFAULT_CLASH_FACTOR = 1
 DEFAULT_REPULSION_POWER = 6
 PUSH_AWAY_INCREMENT = 0.2
 MAX_PUSH_ATTEMPTS = 3

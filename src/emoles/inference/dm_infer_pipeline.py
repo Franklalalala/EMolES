@@ -17,6 +17,7 @@ if __name__ == "__main__":
     )
     dm_infer_entry(
         abs_ase_path=db_path,
-        results_folder_path=os.path.join(output_path, 'results')
+        results_folder_path=os.path.join(output_path, 'results'),
+        gen_esp_cube_flag=True
     )
 

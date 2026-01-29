@@ -452,6 +452,7 @@ def dm_infer_entry(
         cube_grid=75,  # [New] Grid resolution for cube generation
         temp_cube_file="infer_cube_data.pkl",
         summary_filename="inference_summary.npz",
+        gen_esp_cube_flag: bool = False,
         max_items=None,
 ):
     """
@@ -582,7 +583,7 @@ def dm_infer_entry(
                     # Imported from emoles.loss (wraps Multiwfn/Mokit)
                     # prefix="infer" creates infer.fch
                     esp_max, esp_min, phi = calculate_properties_from_dm(
-                        mol, pred_dm, prefix="infer", gen_dm_flag=False
+                        mol, pred_dm, prefix="infer", gen_dm_flag=gen_esp_cube_flag
                     )
                     props["ESP_max_eV"] = esp_max
                     props["ESP_min_eV"] = esp_min

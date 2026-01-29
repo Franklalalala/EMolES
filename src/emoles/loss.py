@@ -486,7 +486,7 @@ def evaluate_dm_from_npy(
         n_save_cube_items: int = 5,  # 新增：专门用于 generate_cube_files 的保存数量
         temp_data_file: str = "temp_cube_data.pkl",  # 新增：保存路径
         max_items: int = 300,
-        dm_grid: int = 40,
+        gen_esp_cube_flag: bool = False,
         summary_filename="evaluation_summary.npz",
 ):
     import time
@@ -663,10 +663,10 @@ def evaluate_dm_from_npy(
                 # 3. 计算 ESP 和 Deformation Factor
                 if get_esp_sta_flag:
                     p_esp_max, p_esp_min, p_phi = calculate_properties_from_dm(
-                        mol, pred_dm, "pred", gen_dm_flag=False
+                        mol, pred_dm, "pred", gen_dm_flag=gen_esp_cube_flag
                     )
                     t_esp_max, t_esp_min, t_phi = calculate_properties_from_dm(
-                        mol, target_dm, "target", gen_dm_flag=False
+                        mol, target_dm, "target", gen_dm_flag=gen_esp_cube_flag
                     )
                     errors["esp_max_mae"] = abs(t_esp_max - p_esp_max)
                     errors["esp_min_mae"] = abs(t_esp_min - p_esp_min)
