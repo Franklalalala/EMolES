@@ -426,10 +426,10 @@ def evaluate_configuration(
 def build_cluster(
         ion_identifier: Union[str, Atoms, Chem.Mol],
         ligand_molecule_info: List[Tuple[Union[str, Atoms, Chem.Mol], int]],
-        relative_score_threshold: float = 0.75,  # used by patch picker for secondary site screening
+        relative_score_threshold: float = 0.85,  # used by patch picker for secondary site screening
         max_patch_atoms: int = 3,
-        initial_sphere_skin_factor: float = 1.25,
-        sphere_skin_increment_factor: float = 0.1,
+        initial_sphere_skin_factor: float = 0.75,
+        sphere_skin_increment_factor: float = 0.02,
         max_sphere_expansions: int = 20,
         target_no_clashes: bool = True,
         rotation_opt_iterations: int = 50,

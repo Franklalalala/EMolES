@@ -106,6 +106,7 @@ def run_batch_build():
                 sphere_skin_increment_factor=0.02,  # 缓慢膨胀
                 target_no_clashes=True,
                 rotation_opt_iterations=50,
+                max_sphere_expansions=20,
                 verbose=False,
                 initial_ligand_orientation="aligned_to_ion"
             )
