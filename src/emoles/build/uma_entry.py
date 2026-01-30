@@ -1,3 +1,4 @@
+# uma_entry.py
 import os
 import re
 import shutil
@@ -35,6 +36,20 @@ def sanitize_name(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_") or "unnamed"
 
 
+def _coerce_int(x, default=None):
+    """Best-effort conversion to int (handles int/float/np scalars/strings)."""
+    if x is None:
+        return default
+    try:
+        if isinstance(x, (np.integer,)):
+            return int(x)
+        if isinstance(x, (np.floating,)):
+            return int(float(x))
+        return int(float(x))
+    except Exception:
+        return default
+
+
 def smiles_to_atoms(smiles: str) -> Atoms:
     """Converts a SMILES string to an ASE Atoms object using RDKit."""
     if not RDKIT_AVAILABLE:
@@ -47,14 +62,11 @@ def smiles_to_atoms(smiles: str) -> Atoms:
     mol = Chem.AddHs(mol)
     res = AllChem.EmbedMolecule(mol, randomSeed=42)
     if res == -1:
-        # Try random coordinates if embedding fails
         AllChem.EmbedMolecule(mol, useRandomCoords=True)
 
-    # Convert RDKit to ASE
     conf = mol.GetConformer()
     positions = conf.GetPositions()
     symbols = [atom.GetSymbol() for atom in mol.GetAtoms()]
-
     return Atoms(symbols=symbols, positions=positions)
 
 
@@ -64,12 +76,13 @@ def prepare_input_source(workspace: str, input_db: str = None, smiles_list: list
     If SMILES are provided, creates a temporary DB and returns its path.
     Otherwise, returns the existing input_db path.
     """
+    os.makedirs(workspace, exist_ok=True)
+
     # Case 1: SMILES provided -> Generate temp DB
     if smiles_list:
         temp_db_path = os.path.join(workspace, 'temp_smiles_input.db')
         print(f"Generating 3D structures from {len(smiles_list)} SMILES -> {temp_db_path} ...")
 
-        # Clean previous temp file if exists
         if os.path.exists(temp_db_path):
             os.remove(temp_db_path)
 
@@ -77,7 +90,6 @@ def prepare_input_source(workspace: str, input_db: str = None, smiles_list: list
             for i, smi in enumerate(smiles_list):
                 try:
                     atoms = smiles_to_atoms(smi)
-                    # Write to DB. Optimization loop will default to charge=1 if n_anion is missing.
                     name = f"smiles_{i}_{sanitize_name(smi[:10])}"
                     db.write(atoms, name=name, smiles=smi)
                 except Exception as e:
@@ -90,6 +102,80 @@ def prepare_input_source(workspace: str, input_db: str = None, smiles_list: list
         return os.path.join(workspace, 'all.db')
 
     return input_db
+
+
+def _merge_row_metadata(row, atoms: Atoms) -> dict:
+    """
+    ASE DB rows can store metadata in multiple places:
+      - row.key_value_pairs
+      - row.data (dict)
+      - atoms.info
+
+    Minimal fix based on your DB inspection:
+      structures.db 中 data['charge'] 是正确的，但 key_value_pairs['charge'] 是错误的(常为1)。
+      因此合并时必须让 row.data 覆盖 row.key_value_pairs。
+    """
+    meta = {}
+
+    # --- MINIMAL CHANGE: merge order swapped so row.data overrides kvp ---
+    # key_value_pairs first
+    try:
+        if getattr(row, "key_value_pairs", None):
+            meta.update(row.key_value_pairs)
+    except Exception:
+        pass
+
+    # row.data second (override kvp; especially for 'charge')
+    try:
+        if getattr(row, "data", None):
+            meta.update(row.data)
+    except Exception:
+        pass
+
+    # atoms.info last fallback (only fill missing keys)
+    try:
+        if isinstance(getattr(atoms, "info", None), dict):
+            for k, v in atoms.info.items():
+                if k not in meta:
+                    meta[k] = v
+    except Exception:
+        pass
+
+    return meta
+
+
+def _infer_charge(atoms: Atoms, meta: dict) -> int:
+    """
+    Charge priority:
+      1) meta['charge'] if present  (now correctly prefers row.data['charge'])
+      2) infer from anion count keys: n_anion, n_anion_total, n_anions, n_anion_tot
+
+    Inference rule (monomer vs cluster):
+      - if structure contains Li: charge = 1 - n_anion   (Li+ cluster convention)
+      - else:                    charge = 0 - n_anion   (monomer convention: solvent 0, anion -1)
+
+    Fallback if no n_anion info:
+      - contains Li -> +1
+      - else -> 0
+    """
+    if "charge" in meta and meta["charge"] is not None:
+        ch = _coerce_int(meta["charge"], default=None)
+        if ch is not None:
+            return int(ch)
+
+    n_anion = None
+    for key in ("n_anion", "n_anion_total", "n_anions", "n_anion_tot"):
+        if key in meta and meta[key] is not None:
+            n_anion = _coerce_int(meta[key], default=None)
+            if n_anion is not None:
+                break
+
+    has_li = ("Li" in atoms.get_chemical_symbols())
+
+    if n_anion is not None:
+        return int((1 - n_anion) if has_li else (0 - n_anion))
+
+    return int(1 if has_li else 0)
 
 
 def entry(
@@ -107,16 +193,16 @@ def entry(
     Main optimization routine.
     Returns: Path to the output database.
     """
-    # 1. Path Setup & Cleanup
+    os.makedirs(workspace, exist_ok=True)
+
+    # 1) Path Setup & Cleanup
     traj_dir = os.path.join(workspace, 'traj')
     out_xyz_dir = os.path.join(workspace, 'optimized_xyz_all')
     out_db_path = os.path.join(workspace, 'optimized_all.db')
 
-    # Cleanup: Remove old outputs to ensure a fresh run
-    # Note: If reusing workspace for multiple steps, be careful.
-    # Here we assume entry() controls its specific workspace folder.
     if os.path.exists(out_db_path):
-        if verbose: print(f"Removing existing output DB: {out_db_path}")
+        if verbose:
+            print(f"Removing existing output DB: {out_db_path}")
         os.remove(out_db_path)
 
     for d in [traj_dir, out_xyz_dir]:
@@ -124,20 +210,20 @@ def entry(
             shutil.rmtree(d)
         os.makedirs(d, exist_ok=True)
 
-    # 2. Prepare Input Source (DB or SMILES->DB)
+    # 2) Prepare Input Source (DB or SMILES->DB)
     active_input_db = prepare_input_source(workspace, input_db, smiles)
 
     if verbose:
         print(f"Workdir: {workspace}\nInput: {active_input_db}\nOutput: {out_db_path}")
 
-    # 3. Model Loading
-    if verbose: print("Loading FAIRChem model...")
-    # Ensure atom_refs cache is in the workspace or a temp loc to avoid permission issues
+    # 3) Model Loading
+    if verbose:
+        print("Loading FAIRChem model...")
     atom_refs = get_isolated_atomic_energies(DEFAULT_MODEL_NAME, workspace)
     predictor = load_predict_unit(checkpoint_path, "default", None, device, atom_refs)
     calc = FAIRChemCalculator(predictor, task_name="omol")
 
-    # 4. Optimization Loop
+    # 4) Optimization Loop
     if not os.path.exists(active_input_db):
         raise FileNotFoundError(f"DB not found: {active_input_db}")
 
@@ -147,74 +233,54 @@ def entry(
         if show_progress:
             rows = tqdm(rows, total=total, desc="Optimizing", unit="mol")
 
+        def _log(msg: str):
+            # Always print (per your requirement), but use tqdm.write to not break the progress bar
+            if show_progress:
+                tqdm.write(msg)
+            else:
+                print(msg)
+        print(active_input_db)
         for row in rows:
             atoms = row.toatoms()
-            kvp = row.key_value_pairs.copy()
-
-            # --- Core Logic: Charge Calculation & Type Enforcing ---
-            try:
-                # 1. Try to read charge/spin directly
-                if 'charge' in kvp:
-                    charge = int(float(kvp['charge']))
-                elif 'n_anion' in kvp:
-                    # Heuristic for cluster: Charge = 1 (Li) - N_Anions * 1
-                    n_anion = int(float(kvp['n_anion']))
-                    charge = int(1 - n_anion)
-                else:
-                    # Default: assume neutral or +1 based on context?
-                    # For safety in this specific Lithium context, default to +1 (often solvated Li)
-                    # unless it looks like a pure anion.
-                    charge = 1
-
-                spin = int(kvp.get('spin', 1))  # Default spin doublet for Li+ systems
-
-            except Exception:
-                # Fallback safety
-                charge, spin = 1, 1
-
-            # Set properties (FAIRChem requires strict int types)
-            atoms.info['charge'] = charge
-            atoms.info['spin'] = spin
-            kvp['charge'] = charge
-            kvp['spin'] = spin
-
-            # --- Optimization ---
-            atoms.calc = calc
-
-            # Determine name
-            if 'xyz_file' in kvp:
-                raw_name = kvp['xyz_file'].strip('.xyz')
-            elif 'name' in kvp:
-                raw_name = kvp['name']
+            charge = row.data.get('charge', None)
+            if charge is None:
+                print('None data_charge detected.')
+                meta = _merge_row_metadata(row, atoms)
+                charge = _infer_charge(atoms, meta)
             else:
-                raw_name = f"id_{row.id}"
+                meta = _merge_row_metadata(row, atoms)
+            spin = 1  # spin 永远是 1，不从任何来源读取/改变
+            # Attach to atoms/info + meta (FAIRChem requires int-like types)
+            atoms.info['charge'] = int(charge)
+            atoms.info['spin'] = int(spin)
+            meta['charge'] = int(charge)
+            meta['spin'] = int(spin)
 
+            # Determine name early (so the log prints a useful identifier)
+            raw_name = meta.get('xyz_file', None) or meta.get('name', None) or f"id_{row.id}"
+            raw_name = os.path.splitext(str(raw_name))[0]
             base_name = sanitize_name(raw_name)
+
+            # Print charge/spin before optimization (every structure)
+            _log(f"[UMA] About to optimize: {base_name} | charge={charge} spin={spin}")
+
+            # ---- Optimization ----
+            atoms.calc = calc
             traj_path = os.path.join(traj_dir, f"{base_name}.traj")
 
             try:
-                # Logfile control: '-' for stdout, None for silence
                 logfile = '-' if (verbose and not show_progress) else None
-
-                if verbose and show_progress:
-                    tqdm.write(f"--- Opt: {base_name} (Q={charge}) ---")
-
                 opt = LBFGS(atoms, trajectory=traj_path, logfile=logfile)
                 opt.run(fmax=fmax, steps=max_steps)
 
-                # Save Results
                 out_xyz = os.path.join(out_xyz_dir, f"{base_name}.xyz")
                 write(out_xyz, atoms)
 
-                atoms.calc = None  # Clean up calculator before saving to DB
-                tgt_db.write(atoms, data=kvp, **kvp)
+                atoms.calc = None  # detach calculator before storing
+                tgt_db.write(atoms, data=meta, **meta)
 
             except Exception as e:
-                msg = f"[Error] {base_name}: {e}"
-                if show_progress:
-                    tqdm.write(msg)
-                else:
-                    print(msg)
+                _log(f"[Error] {base_name}: {e}")
 
     return out_db_path
 

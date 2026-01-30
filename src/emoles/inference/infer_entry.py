@@ -133,7 +133,7 @@ default_fine_tune_input_json_path = r'/share/dptb_ckpt/fine_tune/input.json'
 
 def dptb_infer_from_ase_db(ase_db_path: str, out_path: str,
                            checkpoint_path: str = default_fine_tune_ckpt_path,
-                           limit: int = 200, device: str = 'cuda'):
+                           max_items: int = 200, device: str = 'cuda'):
     import e3nn
     e3nn.set_optimization_defaults(jit_script_fx=False)
 
@@ -170,7 +170,7 @@ def dptb_infer_from_ase_db(ase_db_path: str, out_path: str,
     start_time = time.time()
     idx = 0
     for idx, a_ref_batch in enumerate(reference_loader):
-        if idx >= limit:
+        if idx >= max_items:
             break
         batch = a_ref_batch.to(device)
         batch = AtomicData.to_AtomicDataDict(batch)
@@ -181,7 +181,7 @@ def dptb_infer_from_ase_db(ase_db_path: str, out_path: str,
 
     end_time = time.time()
     print('DPTB inference done.')
-    second_per_item = (end_time - start_time) / max(1, min(idx + 1, limit))
+    second_per_item = (end_time - start_time) / max(1, min(idx + 1, max_items))
     print(f'DPTB Inference Time (s/item): {second_per_item}')
 
 
@@ -504,6 +504,8 @@ def dm_infer_entry(
 
                 # Load charge from DB or default
                 current_mol_charge = a_row.data.get("charge", mol_charge)
+                print(f'current_mol_charge: {current_mol_charge}')
+
                 sum_of_atomic_numbers = an_atoms.get_atomic_numbers().sum()
                 total_electrons = sum_of_atomic_numbers - current_mol_charge
                 mol_spin = total_electrons % 2
@@ -551,6 +553,18 @@ def dm_infer_entry(
                 props["Ne_actual"] = float(total_electrons)
                 props["Ne_pred"] = ne_pred
                 props["Ne_error"] = abs(ne_pred - total_electrons)
+
+                ##################
+                Zsum = int(an_atoms.get_atomic_numbers().sum())
+                Ne_pred = get_electron_number_from_dm(pred_dm, overlap)
+                q_from_dm = Zsum - Ne_pred  # DM 隐含出来的“电荷”(化学定义)
+
+                print("Zsum", Zsum,
+                      "charge(db)", current_mol_charge,
+                      "expected Ne", Zsum - current_mol_charge,
+                      "Ne_pred", Ne_pred,
+                      "q_from_dm", q_from_dm)
+                ##################
 
                 electronic_info = None
                 if calc_electronic_flag:
