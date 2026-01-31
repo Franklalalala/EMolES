@@ -460,10 +460,10 @@ def entry(
     final_kwargs = dict(
         relative_score_threshold=0.85,
         max_patch_atoms=3,
-        initial_sphere_skin_factor=0.75,
-        sphere_skin_increment_factor=0.02,
+        initial_sphere_skin_factor=0.7,
+        sphere_skin_increment_factor=0.01,
         target_no_clashes=True,
-        rotation_opt_iterations=25,
+        rotation_opt_iterations=50,
         verbose=False
     )
     final_kwargs.update(cluster_kwargs)

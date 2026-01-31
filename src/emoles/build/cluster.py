@@ -1,13 +1,13 @@
 from typing import List, Tuple, Dict, Union
 import numpy as np
 import random
-import os  # NEW: for directory handling
+import os
 
 from ase import Atoms
 from ase.io import read, write
 
 from rdkit import Chem
-from scipy.spatial import ConvexHull  # NEW: for convex hull volume estimation
+from scipy.spatial import ConvexHull
 
 from emoles.build.CombineMols3D import (
     get_bond_length,
@@ -16,7 +16,7 @@ from emoles.build.CombineMols3D import (
 )
 from emoles.build.patch_picker import (
     get_patch_atoms_and_indices,
-    atom_2_mol,  # available for users needing RDKit Mol conversion from ASE
+    atom_2_mol,
 )
 
 # =============================================================================
@@ -42,7 +42,6 @@ def make_cache_key(identifier: Union[str, Atoms, Chem.Mol]) -> str:
         return f"XYZ:{identifier}" if is_xyz_path(identifier) else f"SMILES:{identifier}"
     if isinstance(identifier, Atoms):
         # Use object's memory address for a unique key per instance.
-        # This is suitable for caching within a single run.
         return f"ASE@{id(identifier)}"
     if isinstance(identifier, Chem.Mol):
         return f"RDKIT@{id(identifier)}"
@@ -113,17 +112,12 @@ def check_system_clashes(ion_atoms: Atoms, all_ligands: List[Atoms]) -> bool:
 
 
 # =============================================================================
-# Volume estimation (NEW)
+# Volume estimation
 # =============================================================================
 
 def method_convex_hull_volume(atoms: Atoms) -> float:
     """
     Estimate molecular volume using 3D convex hull of atomic positions.
-    - Fast and simple; tends to overestimate since atomic radii are ignored.
-    - Returns 1.0 when points < 4 (no 3D volume), to avoid division by zero.
-
-    The absolute unit is the cube of the coordinate unit (typically Å^3),
-    but we only use relative ratios for scaling.
     """
     pts = atoms.get_positions()
     if len(pts) < 4:
@@ -144,13 +138,10 @@ def get_ase_and_patch(
 ) -> Tuple[Atoms, List[int]]:
     """
     Normalize various identifiers to (ASE Atoms, patch_indices) using patch_picker.
-    - If identifier is a .xyz path: read to ASE, then call patch_picker on Atoms
-    - If identifier is SMILES: call patch_picker directly on string
-    - If identifier is ASE or RDKit Mol: call patch_picker directly
     """
     if isinstance(identifier, str) and is_xyz_path(identifier):
         ase_obj = read(identifier)
-        ase_obj = ase_obj if isinstance(ase_obj, Atoms) else ase_obj[0]  # ensure Atoms object
+        ase_obj = ase_obj if isinstance(ase_obj, Atoms) else ase_obj[0]
         ase_res, patch_idx = get_patch_atoms_and_indices(
             ase_obj,
             relative_score_threshold=relative_score_threshold,
@@ -175,7 +166,6 @@ def prepare_ion(
 ) -> Tuple[Atoms, np.ndarray, str]:
     """
     Build ion as ASE Atoms and return (ion_atoms, ion_center, ion_symbol).
-    For simple ions, patch is just the ion itself.
     """
     ion_ase, _ = get_ase_and_patch(
         ion_identifier,
@@ -188,7 +178,6 @@ def prepare_ion(
     return ion_ase, ion_center, ion_symbol
 
 
-# MODIFIED: Changed function signature and docstring
 def build_ligand_templates(
         ligand_molecule_info: List[Tuple[Union[str, Atoms, Chem.Mol], int]],
         ion_symbol: str,
@@ -197,11 +186,8 @@ def build_ligand_templates(
         verbose: bool,
 ) -> List[Tuple[Atoms, List[int], np.ndarray, float, Union[str, Atoms, Chem.Mol]]]:
     """
-    Build ligand templates as tuples:
-      (ase_mol, patch_indices, patch_centroid_local, avg_ideal_patch_ion_dist, key_obj)
-    - Accepts a list of (identifier, count) tuples.
-    - Identifiers can be SMILES strings, XYZ file paths, ASE Atoms, or RDKit Mol.
-    - Uses a simple runtime cache by key object/type to avoid recomputation.
+    Build ligand templates as tuples.
+    Returns a list where identical molecules are grouped together initially.
     """
     cache: Dict[str, Tuple[Atoms, List[int], np.ndarray, float]] = {}
     templates: List[Tuple[Atoms, List[int], np.ndarray, float, Union[str, Atoms, Chem.Mol]]] = []
@@ -209,7 +195,6 @@ def build_ligand_templates(
     if verbose:
         print("\n--- Ligand Template Preparation ---")
 
-    # MODIFIED: Changed loop to iterate over a list of tuples directly
     for key_obj, count in ligand_molecule_info:
         cache_key = make_cache_key(key_obj)
         if cache_key not in cache:
@@ -233,7 +218,6 @@ def build_ligand_templates(
                 ion_symbol, mol_ase.get_chemical_symbols()[0], skin=0
             )
 
-            # Use a more descriptive name for the identifier in the print statement
             identifier_name = key_obj if isinstance(key_obj, str) else type(key_obj).__name__
             if verbose:
                 print(f"    {identifier_name}: Avg ideal patch-ion distance = {avg_ideal_dist:.3f} Å")
@@ -261,30 +245,27 @@ def place_ligands_initial(
         orientation_mode: str,
 ) -> Tuple[List[Atoms], np.ndarray]:
     """
-    Place ligands on a sphere around ion, aligning each ligand’s patch centroid to its target point.
-    Return (placed_ligands, target_centroid_world_coords).
-
-    MODIFIED: Add convex-hull-volume-aware scaling of ion-ligand initial distances.
-    Small-volume ligands get larger distances to avoid bias (only enlarge, never shrink).
+    Place ligands on a sphere around ion.
+    The ligand_templates list should be pre-shuffled if random mixing is desired.
     """
     total = len(ligand_templates)
     if total == 0:
         return [], np.zeros((0, 3))
 
-    # NEW: volume-aware distance scaling using convex hull volume
+    # volume-aware distance scaling
     volumes = [max(method_convex_hull_volume(tpl[0]), 1e-12) for tpl in ligand_templates]
-    vol_ref = float(np.max(volumes)) if len(volumes) > 0 else 1.0  # robust reference
+    vol_ref = float(np.max(volumes)) if len(volumes) > 0 else 1.0
 
     # Scale factor on length from volume ratio: L ~ V^(1/3)
     volume_scales = []
     for v in volumes:
         raw = (vol_ref / max(v, 1e-12)) ** (1.0 / 8.0)
-        volume_scales.append(float(raw))  # only enlarge small ligands
+        volume_scales.append(float(raw))
 
     base_target_distances = [tpl[3] * sphere_dist_factor for tpl in ligand_templates]
     target_distances = [base_target_distances[i] * volume_scales[i] for i in range(total)]
 
-    directions = fibonacci_sphere(total, radius=1.0, center=np.array([0.0, 0.0, 0.0]))  # unit directions
+    directions = fibonacci_sphere(total, radius=1.0, center=np.array([0.0, 0.0, 0.0]))
 
     ligands: List[Atoms] = []
     target_centroids = np.empty((total, 3))
@@ -323,12 +304,11 @@ def optimize_ligand_orientations(
         rotation_opt_iterations: int,
         rotation_samples_per_ligand: int,
         verbose: bool,
-        debug_save_dir: str = None,  # NEW: Argument to specify debug output directory
-        current_sphere_attempt: int = 0  # NEW: To label the step correctly
+        debug_save_dir: str = None,
+        current_sphere_attempt: int = 0
 ) -> List[Atoms]:
     """
     Stochastic orientation optimization by random local rotations around each ligand’s patch centroid.
-    MODIFIED: In verbose mode with debug_save_dir, saves intermediate structures every 3 iterations.
     """
     total = len(ligands)
     for rot_iter in range(rotation_opt_iterations):
@@ -367,15 +347,12 @@ def optimize_ligand_orientations(
                 improvements += 1
             ligands[idx] = best_local
 
-        # NEW: Save intermediate step configuration every 3rd "small step"
         if verbose and debug_save_dir and (rot_iter + 1) % 3 == 0:
             step_snapshot = ion_atoms.copy()
             for lig in ligands:
                 step_snapshot.extend(lig)
             step_filename = os.path.join(debug_save_dir, f"step_{current_sphere_attempt + 1}_rot_{rot_iter + 1}.xyz")
             write(step_filename, step_snapshot)
-            # Optional: Uncomment if too spammy
-            # print(f"    [DEBUG] Saved rotation step {rot_iter + 1} to: {step_filename}")
 
         if verbose and (rot_iter % 10 == 0 or rot_iter == rotation_opt_iterations - 1 or improvements == 0):
             rep_sum_no_clash = 0.0
@@ -422,11 +399,10 @@ def evaluate_configuration(
 # Main cluster builder
 # =============================================================================
 
-# MODIFIED: Changed function signature and docstring
 def build_cluster(
         ion_identifier: Union[str, Atoms, Chem.Mol],
         ligand_molecule_info: List[Tuple[Union[str, Atoms, Chem.Mol], int]],
-        relative_score_threshold: float = 0.85,  # used by patch picker for secondary site screening
+        relative_score_threshold: float = 0.85,
         max_patch_atoms: int = 3,
         initial_sphere_skin_factor: float = 0.75,
         sphere_skin_increment_factor: float = 0.02,
@@ -434,45 +410,30 @@ def build_cluster(
         target_no_clashes: bool = True,
         rotation_opt_iterations: int = 50,
         rotation_samples_per_ligand: int = 80,
-        initial_ligand_orientation: str = "aligned_to_ion",  # 'random' or 'aligned_to_ion'
+        initial_ligand_orientation: str = "aligned_to_ion",
         verbose: bool = True,
-        debug_save_dir: str = None,  # NEW: Argument to specify debug output directory
+        debug_save_dir: str = None,
 ) -> Atoms:
     """
     Build a cluster: ion + multiple ligands.
-
-    Inputs supported for ion_identifier and ligand_molecule_info identifiers:
-      - SMILES string
-      - XYZ file path (string ending with .xyz)
-      - ASE Atoms
-      - RDKit Mol
-
-    The 'ligand_molecule_info' argument is a list of tuples, where each tuple
-    contains a molecule identifier and its count, e.g., [("CCO", 2), (water_atoms, 4)].
-
-    Uses get_patch_atoms_and_indices (new API) from patch_picker to detect patch atoms.
     """
     if verbose:
-        # MODIFIED: Changed how total ligand count is calculated
         total_ligs = sum(count for _, count in ligand_molecule_info)
         print(f"--- Cluster Build Initiated: {str(ion_identifier)} + {total_ligs} Ligands ---")
         print(f"  Using DEFAULT_CLASH_FACTOR (from CombineMols3D): {DEFAULT_CLASH_FACTOR}")
         if debug_save_dir:
             print(f"  Debug output enabled. Saving intermediate steps to: {debug_save_dir}")
 
-    # Prepare Debug Directory if needed
     if verbose and debug_save_dir:
         if not os.path.exists(debug_save_dir):
             os.makedirs(debug_save_dir, exist_ok=True)
 
-    # Ion prepared via patch picker; for simple ions, patch = [0]
     ase_ion, ion_center, ion_symbol = prepare_ion(
         ion_identifier=ion_identifier,
         relative_score_threshold=relative_score_threshold,
         verbose=verbose,
     )
 
-    # Ligand templates
     ligand_templates = build_ligand_templates(
         ligand_molecule_info=ligand_molecule_info,
         ion_symbol=ion_symbol,
@@ -483,7 +444,14 @@ def build_cluster(
     if len(ligand_templates) == 0:
         return ase_ion
 
-    # Sphere placement + optimization across expansions
+    # =========================================================================
+    # FIX: Random shuffle the templates to mix different species on the sphere
+    # =========================================================================
+    # Before this, the list is [TypeA, TypeA, ..., TypeB, TypeB].
+    # Since sphere points are generated in spiral order, this caused clustering.
+    random.shuffle(ligand_templates)
+    # =========================================================================
+
     best_config: List[Atoms] = []
     best_score = float("inf")
     best_has_clash = True
@@ -503,7 +471,6 @@ def build_cluster(
         )
 
         # Orientation optimization
-        # MODIFIED: Pass debug args to inner loop
         placed = optimize_ligand_orientations(
             ion_atoms=ase_ion,
             ligands=placed,
@@ -515,7 +482,7 @@ def build_cluster(
             current_sphere_attempt=attempt
         )
 
-        # Evaluate configuration
+        # Evaluate
         has_clashes, total_score = evaluate_configuration(ase_ion, placed)
         if verbose:
             status = "Clashes Present" if has_clashes else "Clash-Free"
@@ -542,7 +509,6 @@ def build_cluster(
 
         sphere_factor += sphere_skin_increment_factor
 
-    # Assemble final cluster
     final_cluster = ase_ion.copy()
     for lig in best_config:
         final_cluster.extend(lig)
@@ -559,68 +525,25 @@ def build_cluster(
 # Examples
 # =============================================================================
 if __name__ == "__main__":
-    # Example 1: SMILES-only workflow
-    # ec = "C1COC(=O)O1"  # Ethylene carbonate (EC)
-    # ec = 'COCCOCC(F)F'  # DMC
-    # fsi = "N#CC1=C(C#N)[N-]C(C(F)(F)F)=N1"  # Bis(fluorosulfonyl)imide (FSI)
-    # fsi = "[B-](F)(F)(F)(F)"  # Bis(fluorosulfonyl)imide (FSI)
-    dme = "COCCOC"  # DME
-
-    # Specify a directory for debug steps
-    debug_dir = "debug_steps_output"
-
-    # CHANGED: Using a list of tuples instead of a dictionary
-    cluster1 = build_cluster(
-        ion_identifier="Li",
-        ligand_molecule_info=[(dme, 4)],
-        # ligand_molecule_info=[(ec, 1), (fsi, 1)],
-        verbose=True,
-        debug_save_dir=debug_dir  # Pass the directory here
-    )
-    write("Li_1DME_cluster.xyz", cluster1)
-    print("Wrote Li_1DME_cluster.xyz")
-
-    # # Example 2: Mixed SMILES and XYZ path
-    # # Replace 'methanol.xyz' with a real path on your machine
-    # methanol_xyz_path = "methanol.xyz"
-    # cluster2 = build_cluster(
-    #     ion_identifier="Li",
-    #     # CHANGED: Using a list of tuples
-    #     ligand_molecule_info=[(ec, 1), (methanol_xyz_path, 1)],
-    #     relative_score_threshold=0.7,
-    #     max_patch_atoms=2,
-    #     initial_sphere_skin_factor=1.2,
-    #     sphere_skin_increment_factor=0.1,
-    #     max_sphere_expansions=5,
-    #     target_no_clashes=True,
-    #     rotation_opt_iterations=30,
-    #     rotation_samples_per_ligand=60,
-    #     initial_ligand_orientation="random",
-    #     verbose=True,
-    # )
-    # write("Li_EC_MeOHxyz_cluster.xyz", cluster2)
-    # print("Wrote Li_EC_MeOHxyz_cluster.xyz")
-
-    # Example 3: Direct ASE Atoms input as a ligand (THIS NOW WORKS)
     from ase.build import molecule
 
-    water_atoms = molecule("H2O")  # ASE Atoms
+    # Example setup
+    dme = "COCCOC"  # DME
+    water_atoms = molecule("H2O")
 
-    # CHANGED: Using a list of tuples to avoid the unhashable type error
-    cluster3 = build_cluster(
-        ion_identifier="Na",
-        ligand_molecule_info=[(water_atoms, 2)],  # mix of ASE Atoms and SMILES
+    # 比如这里输入 2个DME 和 2个H2O
+    # 之前可能出现 [DME, DME, H2O, H2O] 的顺序分布在球面上
+    # 现在会随机混合，比如 [DME, H2O, DME, H2O] 或其他随机排列
+    debug_dir = "debug_mixed_steps"
+
+    cluster_mixed = build_cluster(
+        ion_identifier="Li",
+        ligand_molecule_info=[(dme, 2), (water_atoms, 2)],
         relative_score_threshold=0.7,
         max_patch_atoms=2,
-        initial_sphere_skin_factor=1.2,
-        sphere_skin_increment_factor=0.1,
-        max_sphere_expansions=5,
         target_no_clashes=True,
-        rotation_opt_iterations=30,
-        rotation_samples_per_ligand=60,
-        initial_ligand_orientation="random",
         verbose=True,
-        debug_save_dir="debug_Na_steps"
+        debug_save_dir=debug_dir
     )
-    write("Na_2H2O_1EC_cluster.xyz", cluster3)
-    print("Wrote Na_2H2O_1EC_cluster.xyz")
+    write("Li_2DME_2H2O_mixed.xyz", cluster_mixed)
+    print("Wrote Li_2DME_2H2O_mixed.xyz")
