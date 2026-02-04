@@ -21,7 +21,7 @@ from emoles.build.cluster import build_cluster
 
 # 2. UMA Import (Optional/Safe)
 try:
-    import uma_entry
+    import emoles.build.uma_entry as uma_entry
 
     UMA_AVAILABLE = True
 except ImportError:
@@ -366,6 +366,7 @@ def build_from_plan(
 
             if lig['type'] == 'anion' and isinstance(atoms_obj, Atoms):
                 atoms_obj.charge = -1
+                atoms_obj.set_initial_charges(np.full(len(atoms_obj), -1 / len(atoms_obj)))
             ligand_info_arg.append((atoms_obj, lig['count']))
 
         fname = compose_filename(ion, item)
@@ -458,8 +459,8 @@ def entry(
 
     # 3. Build (Strict hyperparameters from snippet)
     final_kwargs = dict(
-        relative_score_threshold=0.85,
-        max_patch_atoms=3,
+        relative_score_threshold=0.8,
+        max_patch_atoms=2,
         initial_sphere_skin_factor=0.7,
         sphere_skin_increment_factor=0.01,
         target_no_clashes=True,
