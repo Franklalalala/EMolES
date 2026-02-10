@@ -7,7 +7,7 @@ from ase import Atoms
 from ase.io import read, write
 
 from rdkit import Chem
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, QhullError
 
 from emoles.build.CombineMols3D import (
     get_bond_length,
@@ -115,15 +115,34 @@ def check_system_clashes(ion_atoms: Atoms, all_ligands: List[Atoms]) -> bool:
 # Volume estimation
 # =============================================================================
 
+
 def method_convex_hull_volume(atoms: Atoms) -> float:
     """
     Estimate molecular volume using 3D convex hull of atomic positions.
+    Robustly handles planar molecules (like NO3-) where ConvexHull fails.
     """
     pts = atoms.get_positions()
+
+    # 1. 点太少，直接返回默认小体积
     if len(pts) < 4:
-        return 1.0  # fewer than 4 points can't form a 3D volume; small positive sentinel
-    hull = ConvexHull(pts)
-    return float(hull.volume)
+        return 1.0
+
+    try:
+        # 尝试计算凸包体积
+        hull = ConvexHull(pts)
+        vol = float(hull.volume)
+        # 如果算出来体积极其小（接近平面），也给个保底值
+        return max(vol, 1.0)
+
+    except QhullError:
+        # 2. 捕获 Qhull 错误 (例如平面分子 NO3-)
+        # 这种情况下分子虽然几何体积为0，但物理占位不为0
+        # 返回一个估算值，例如：原子数 * 这里的经验系数
+        # 或者直接返回一个默认值 10.0 (约等于一个小分子的体积)
+        return float(len(pts)) * 2.0
+    except Exception:
+        # 捕获其他可能的异常
+        return 5.0
 
 
 # =============================================================================

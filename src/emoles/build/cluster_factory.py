@@ -6,6 +6,11 @@ import itertools
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Union, Generator
 
+# ==========================================
+# New Import for Parallelism
+# ==========================================
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import numpy as np
 from ase import Atoms
 from ase.db import connect
@@ -335,28 +340,18 @@ def compose_filename(ion: str, plan_item: Dict) -> str:
     return "_".join(parts) + ".xyz"
 
 
-def build_from_plan(
-        plan: List[Dict],
-        out_dir: Path,
-        ion: str,
-        cluster_kwargs: Dict,
-        show_progress: bool,
-) -> Dict[str, int]:
-    stats = {'attempted': 0, 'built': 0, 'failed': 0}
+# ==========================================
+# Worker Function for Parallel Processing
+# ==========================================
+def _worker_build_task(item: Dict, ion: str, xyz_dir: Path, cluster_kwargs: Dict) -> Tuple[
+    bool, Optional[Dict], Optional[str]]:
+    """
+    Worker function to build a single cluster.
+    Returns: (success, result_metadata_dict_for_db, error_message)
+    """
+    fname = compose_filename(ion, item)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    db_path = out_dir / "structures.db"
-    if db_path.exists(): os.remove(db_path)
-    db = connect(db_path)
-
-    xyz_dir = out_dir / "xyz"
-    xyz_dir.mkdir(exist_ok=True)
-
-    iter_obj = tqdm(plan, desc="Building Clusters", unit="item") if show_progress else plan
-
-    for item in iter_obj:
-        stats['attempted'] += 1
-
+    try:
         ligand_info_arg = []
         for lig in item['ligands']:
             atoms_obj = lig['entry']['atoms']
@@ -369,48 +364,99 @@ def build_from_plan(
                 atoms_obj.set_initial_charges(np.full(len(atoms_obj), -1 / len(atoms_obj)))
             ligand_info_arg.append((atoms_obj, lig['count']))
 
-        fname = compose_filename(ion, item)
+        # CPU-intensive part
+        cluster = build_cluster(
+            ion_identifier=ion,
+            ligand_molecule_info=ligand_info_arg,
+            **cluster_kwargs
+        )
+
+        cluster.info['charge'] = item['charge']
+        cluster.info['category'] = item['category']
+
+        ion_symbol = ''.join([c for c in ion if c.isalpha()])
+        for atom in cluster:
+            if atom.symbol == ion_symbol:
+                atom.charge = 1.0
+                break
+
+        # Parallel file write is safe if filenames are unique
+        write(str(xyz_dir / fname), cluster)
+
+        kvp = {
+            'category': item['category'],
+            'ion': ion,
+            'charge': item['charge'],
+            'total_coord': item['total_coord'],
+            'n_atoms': len(cluster),
+            'filename': fname,
+            'mix_type': item.get('mix_type', 'unknown')
+        }
+        for i, lig in enumerate(item['ligands']):
+            kvp[f"lig_{i}_name"] = lig['entry']['name']
+            kvp[f"lig_{i}_type"] = lig['type']
+            kvp[f"lig_{i}_count"] = lig['count']
+
+        # We must return the atoms object to the main process to write to DB
+        # But pickling large objects back can be slow.
+        # Since we already wrote the XYZ, maybe we reload it or just pass it back.
+        # Passing it back is usually fine for these sizes.
+
+        return True, (cluster, kvp), None
+
+    except Exception as e:
+        return False, None, str(e)
+
+
+def build_from_plan(
+        plan: List[Dict],
+        out_dir: Path,
+        ion: str,
+        cluster_kwargs: Dict,
+        show_progress: bool,
+        n_jobs: int = 32  # Added n_jobs
+) -> Dict[str, int]:
+    stats = {'attempted': 0, 'built': 0, 'failed': 0}
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    db_path = out_dir / "structures.db"
+    if db_path.exists(): os.remove(db_path)
+
+    # DB connection must remain in main process
+    db = connect(db_path)
+
+    xyz_dir = out_dir / "xyz"
+    xyz_dir.mkdir(exist_ok=True)
+
+    total_items = len(plan)
+
+    print(f"Starting parallel build with {n_jobs} workers...")
+
+    with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+        # Submit all tasks
+        futures = {
+            executor.submit(_worker_build_task, item, ion, xyz_dir, cluster_kwargs): item
+            for item in plan
+        }
+
+        # Process results as they complete
+        iterator = as_completed(futures)
         if show_progress:
-            iter_obj.set_postfix_str(f"{fname[:30]}...")
+            iterator = tqdm(iterator, total=total_items, desc="Building Clusters", unit="item")
 
-        try:
-            cluster = build_cluster(
-                ion_identifier=ion,
-                ligand_molecule_info=ligand_info_arg,
-                **cluster_kwargs
-            )
+        for future in iterator:
+            stats['attempted'] += 1
+            success, data, error = future.result()
 
-            cluster.info['charge'] = item['charge']
-            cluster.info['category'] = item['category']
-
-            ion_symbol = ''.join([c for c in ion if c.isalpha()])
-            for atom in cluster:
-                if atom.symbol == ion_symbol:
-                    atom.charge = 1.0
-                    break
-
-            write(str(xyz_dir / fname), cluster)
-
-            kvp = {
-                'category': item['category'],
-                'ion': ion,
-                'charge': item['charge'],
-                'total_coord': item['total_coord'],
-                'n_atoms': len(cluster),
-                'filename': fname,
-                'mix_type': item.get('mix_type', 'unknown')
-            }
-            for i, lig in enumerate(item['ligands']):
-                kvp[f"lig_{i}_name"] = lig['entry']['name']
-                kvp[f"lig_{i}_type"] = lig['type']
-                kvp[f"lig_{i}_count"] = lig['count']
-
-            db.write(cluster, data=kvp, **kvp)
-            stats['built'] += 1
-
-        except Exception as e:
-            stats['failed'] += 1
-            # print(f"Failed {fname}: {e}")
+            if success:
+                cluster_obj, kvp = data
+                # Write to DB (Sequential, safe)
+                db.write(cluster_obj, data=kvp, **kvp)
+                stats['built'] += 1
+            else:
+                stats['failed'] += 1
+                # Optional: print error if verbose
+                print(f"Failed: {error}")
 
     return stats
 
@@ -424,13 +470,14 @@ def entry(
         anion_counts: Tuple[int, ...] = (1,),
         mix_n_list: Tuple[int, ...] = (1,),
         num_mixtures: int = 10,
-        use_uma: bool = True,  # Renamed/Changed logic
+        use_uma: bool = True,
         device: str = "cuda",
         verbose: bool = True,
         show_progress: bool = True,
+        n_jobs: int = 32,  # Added n_jobs arg
         **cluster_kwargs
 ):
-    # 1. Load Data (Passing use_uma flag)
+    # 1. Load Data
     solv_data = normalize_input_data(solvents, "Solvent", show_progress, out_dir, device, use_uma)
     anion_data = normalize_input_data(anions, "Anion", show_progress, out_dir, device, use_uma)
 
@@ -465,12 +512,14 @@ def entry(
         sphere_skin_increment_factor=0.01,
         target_no_clashes=True,
         rotation_opt_iterations=50,
+        max_sphere_expansions=100,
         verbose=False
     )
     final_kwargs.update(cluster_kwargs)
 
     out_path = Path(out_dir)
-    stats = build_from_plan(full_plan, out_path, ion, final_kwargs, show_progress)
+    # Pass n_jobs to build_from_plan
+    stats = build_from_plan(full_plan, out_path, ion, final_kwargs, show_progress, n_jobs=n_jobs)
 
     print(f"Build Done: {stats['built']}/{stats['attempted']} success.")
 
@@ -510,9 +559,12 @@ def main():
     parser.add_argument('--mix-n', default='1', help="List of mix sizes (e.g. '1,2')")
     parser.add_argument('--num-mixtures', type=int, default=10, help="Max random solvent combinations")
 
-    # Flags - CHANGED: --no-opt to --no-uma
+    # Parallelism
+    parser.add_argument('--workers', type=int, default=64, dest='n_jobs',
+                        help="Number of parallel build processes (default: 32)")
+
+    # Flags
     parser.add_argument('--no-uma', action='store_false', dest='use_uma', help="Disable UMA pre/post-optimization")
-    # Default is use_uma=True unless --no-uma is passed
     parser.set_defaults(use_uma=True)
 
     parser.add_argument('--device', default='cuda')
@@ -542,9 +594,10 @@ def main():
         anion_counts=a_counts,
         mix_n_list=m_n_list,
         num_mixtures=args.num_mixtures,
-        use_uma=args.use_uma,  # New flag
+        use_uma=args.use_uma,
         device=args.device,
-        verbose=args.verbose
+        verbose=args.verbose,
+        n_jobs=args.n_jobs  # Pass n_jobs
     )
 
 

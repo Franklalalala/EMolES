@@ -39,15 +39,86 @@ SIMPLE_IONS = {
     "MG": "Mg", "CA": "Ca", "ZN": "Zn",
 }
 
-COMPLEX_ANIONS = {
-    "BF4": {"center": "B", "ligand": "F", "count": 4},  # BF4-
-    "PF6": {"center": "P", "ligand": "F", "count": 6},  # PF6-
-    "ClO4": {"center": "Cl", "ligand": "O", "count": 4},  # ClO4-
-    "NO3": {"center": "N", "ligand": "O", "count": 3},  # NO3-
-}
+
 
 DONOR_ML_DIST = {"O": 2.10, "F": 2.00, "N": 2.15, "S": 2.30, "Cl": 2.40}
 DEFAULT_ML_DIST = 2.20
+
+# =============================================================================
+# [UPDATE 1] Replace the old COMPLEX_ANIONS dictionary with this block
+# =============================================================================
+
+COMPLEX_ANIONS = {
+    "BF4": {"center": "B", "ligand": "F", "count": 4, "return_count": 1},  # Tetrahedral, monodentate is fine
+    "PF6": {"center": "P", "ligand": "F", "count": 6, "return_count": 1},  # Octahedral, monodentate is fine
+    "ClO4": {"center": "Cl", "ligand": "O", "count": 4, "return_count": 1},  # Tetrahedral
+    "NO3": {"center": "N", "ligand": "O", "count": 3, "return_count": 2},  # [CRITICAL FIX] Planar, Bidentate required
+}
+
+
+# =============================================================================
+# [UPDATE 2] Replace the _detect_complex_anion function
+# =============================================================================
+
+def _detect_complex_anion(identifier: Union[str, Atoms, Chem.Mol]) -> Optional[Tuple[str, Atoms, List[int]]]:
+    """
+    Detects BF4-, PF6-, ClO4-, NO3- and returns representative binding atoms.
+
+    Updated Logic:
+    - Now returns a LIST of indices based on 'return_count'.
+    - Specifically allows NO3 to return 2 Oxygen indices for bidentate coordination.
+    """
+    if isinstance(identifier, str):
+        try:
+            mol = Chem.MolFromSmiles(identifier)
+            if mol is None:
+                return None
+            mol = Chem.AddHs(mol)
+            AllChem.EmbedMolecule(mol, AllChem.ETKDG())
+            try:
+                mol.UpdatePropertyCache(strict=False)
+            except Exception:
+                pass
+            ase_atoms = mol_2_atoms(mol)
+        except Exception:
+            return None
+    elif isinstance(identifier, Atoms):
+        ase_atoms = identifier
+    elif isinstance(identifier, Chem.Mol):
+        ase_atoms = mol_2_atoms(identifier)
+    else:
+        return None
+
+    symbols = ase_atoms.get_chemical_symbols()
+
+    for anion_name, pattern in COMPLEX_ANIONS.items():
+        center_symbol = pattern["center"]
+        ligand_symbol = pattern["ligand"]
+        expected_count = pattern["count"]
+        return_count = pattern.get("return_count", 1)
+
+        # Check composition (e.g. 1 N and 3 O for NO3)
+        if symbols.count(center_symbol) == 1 and symbols.count(ligand_symbol) == expected_count:
+            total_non_h = sum(1 for s in symbols if s != "H")
+
+            # Ensure no other heavy atoms exist
+            if total_non_h == (1 + expected_count):
+                # Collect ALL matching ligand indices
+                ligand_indices = []
+                for idx, symbol in enumerate(symbols):
+                    if symbol == ligand_symbol:
+                        ligand_indices.append(idx)
+
+                # Return the requested number of anchor points
+                # For NO3, this returns 2 Oxygens; for PF6, returns 1 Fluorine.
+                return anion_name, ase_atoms, ligand_indices[:return_count]
+
+    return None
+
+
+# =============================================================================
+# [UPDATE 3] Replace the get_patch_atoms_and_indices function
+# =============================================================================
 
 
 # =============================================================================
@@ -150,46 +221,6 @@ def mol_2_atoms(mol: Chem.Mol) -> Atoms:
 # 3. HELPER FUNCTIONS
 # =============================================================================
 
-def _detect_complex_anion(identifier: Union[str, Atoms, Chem.Mol]) -> Optional[Tuple[str, Atoms, int]]:
-    """
-    Detects BF4-, PF6-, ClO4-, NO3- and returns a representative binding atom.
-    """
-    if isinstance(identifier, str):
-        try:
-            mol = Chem.MolFromSmiles(identifier)
-            if mol is None:
-                return None
-            mol = Chem.AddHs(mol)
-            AllChem.EmbedMolecule(mol, AllChem.ETKDG())
-            try:
-                mol.UpdatePropertyCache(strict=False)
-            except Exception:
-                pass
-            ase_atoms = mol_2_atoms(mol)
-        except Exception:
-            return None
-    elif isinstance(identifier, Atoms):
-        ase_atoms = identifier
-    elif isinstance(identifier, Chem.Mol):
-        ase_atoms = mol_2_atoms(identifier)
-    else:
-        return None
-
-    symbols = ase_atoms.get_chemical_symbols()
-
-    for anion_name, pattern in COMPLEX_ANIONS.items():
-        center_symbol = pattern["center"]
-        ligand_symbol = pattern["ligand"]
-        expected_count = pattern["count"]
-
-        if symbols.count(center_symbol) == 1 and symbols.count(ligand_symbol) == expected_count:
-            total_non_h = sum(1 for s in symbols if s != "H")
-            if total_non_h == (1 + expected_count):
-                # Return index of first ligand atom (e.g., first F)
-                for idx, symbol in enumerate(symbols):
-                    if symbol == ligand_symbol:
-                        return anion_name, ase_atoms, idx
-    return None
 
 
 def _parse_input(identifier: Union[str, Atoms, Chem.Mol], total_charge=None) -> Chem.Mol:
@@ -364,7 +395,6 @@ def _average_synergy(mol: Chem.Mol, cand_idx: int, selected: List[int]) -> float
 # =============================================================================
 # 5. MAIN EXPORT FUNCTION
 # =============================================================================
-
 def get_patch_atoms_and_indices(
         identifier: Union[str, Atoms, Chem.Mol],
         relative_score_threshold: float = 0.8,
@@ -379,11 +409,10 @@ def get_patch_atoms_and_indices(
 
     [INTEGRATED FIX]:
     - Short-circuits for single-atom inputs (e.g., Li+) to prevent RDKit errors.
+    - Properly handles multi-atom anchors for complex anions (e.g. NO3 bidentate).
     """
 
     # [HOTFIX INTEGRATION]: Single Atom Bypass
-    # If input is a single ASE atom (e.g. Li+), return it immediately.
-    # No need for RDKit topology, embeddings, or scoring.
     if isinstance(identifier, Atoms) and len(identifier) == 1:
         if verbose:
             print("Detected single atom input, returning immediately.")
@@ -394,19 +423,19 @@ def get_patch_atoms_and_indices(
         sym = SIMPLE_IONS[identifier.upper()]
         return Atoms(sym, positions=[[0.0, 0.0, 0.0]]), [0]
 
-    # 2. Handle known Complex Anions (e.g., BF4-)
+    # 2. Handle known Complex Anions (e.g., BF4-, NO3-)
     anion_result = _detect_complex_anion(identifier)
     if anion_result is not None:
-        anion_name, ase_atoms, coord_idx = anion_result
+        anion_name, ase_atoms, coord_indices = anion_result
         if verbose:
-            print(f"Detected {anion_name}⁻ anion, returning atom at index {coord_idx}")
-        return ase_atoms, [coord_idx]
+            print(f"Detected {anion_name}⁻ anion, forcing indices {coord_indices}")
+        # Directly return the hardcoded anchor indices (e.g. [0, 1] for NO3)
+        return ase_atoms, coord_indices
 
     # 3. Parse Input -> RDKit Mol
-    # (Includes internal charge fallback logic in atom_2_mol)
     mol = _parse_input(identifier, total_charge)
 
-    # 4. Compute Scores
+    # 4. Compute Scores (Generic Logic)
     scores = _compute_atom_scores(mol)
     scores.sort(key=lambda x: x[1], reverse=True)
 
