@@ -929,7 +929,7 @@ def get_convention(fchk_path):
                 dftio_parts.append(f"{count}{orb_type}")
         atom_to_dftio_orbitals[elem] = ''.join(dftio_parts)
 
-        # 生成转换索引（Gaussian -> PySCF）
+        # 生成转换索引（Gaussian -> dftio）
         indices = []
         ao_counter = 0
 
@@ -940,27 +940,27 @@ def get_convention(fchk_path):
                 ao_counter += 1
 
             elif shell == 'p':
-                # p轨道：3个分量，顺序相同
-                for i in range(3):
-                    indices.append(ao_counter + i)
+                gauss_to_dftio = [1, 2, 0]  # 从Gaussian顺序到dftio顺序
+                for idx in gauss_to_dftio:
+                    indices.append(ao_counter + idx)
                 ao_counter += 3
 
             elif shell == 'd':
                 # d轨道：球谐5个分量
                 # Gaussian顺序: d0, d+1, d-1, d+2, d-2 (即 z², xz, yz, x²-y², xy)
-                # PySCF顺序: d-2, d-1, d0, d+1, d+2 (即 xy, yz, z², xz, x²-y²)
+                # dftio顺序: d-2, d-1, d0, d+1, d+2 (即 xy, yz, z², xz, x²-y²)
                 # 映射: [2, 3, 4, 1, 0] -> [0, 1, 2, 3, 4]
-                gauss_to_pyscf = [4, 2, 0, 1, 3]  # 从Gaussian顺序到PySCF顺序
-                for idx in gauss_to_pyscf:
+                gauss_to_dftio = [4, 2, 0, 1, 3]  # 从Gaussian顺序到dftio顺序
+                for idx in gauss_to_dftio:
                     indices.append(ao_counter + idx)
                 ao_counter += 5
 
             elif shell == 'f':
                 # f轨道：球谐7个分量
                 # Gaussian顺序: f0, f+1, f-1, f+2, f-2, f+3, f-3
-                # PySCF顺序: f-3, f-2, f-1, f0, f+1, f+2, f+3
-                gauss_to_pyscf = [6, 4, 2, 0, 1, 3, 5]
-                for idx in gauss_to_pyscf:
+                # dftio顺序: f-3, f-2, f-1, f0, f+1, f+2, f+3
+                gauss_to_dftio = [6, 4, 2, 0, 1, 3, 5]
+                for idx in gauss_to_dftio:
                     indices.append(ao_counter + idx)
                 ao_counter += 7
 

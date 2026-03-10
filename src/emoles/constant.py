@@ -21,6 +21,7 @@ atom_to_transform_indices = {
     'B':  [0, 1, 2, 3, 4, 5, 6, 7, 8, 13, 11, 9, 10, 12],  #  <-- B (sssppd)
     'P':  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 17, 15, 13, 14, 16], # <-- P (sssspppd)
     'S':  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 17, 15, 13, 14, 16], # <-- S (sssspppd)
+    'Cl':  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 17, 15, 13, 14, 16], # <-- S (sssspppd)
     'Li': [0, 1, 2, 3, 4, 5, 6, 7, 8],
     'H':  [0, 1, 2, 3, 4]
 }
@@ -67,15 +68,16 @@ convention_dict = {
     ),
     'back2pyscf': Namespace(
         atom_to_orbitals_map={
-            1: 'ssp',  # H
-            3: 'ssspp',  # Li
-            5: 'sssppd',  # B
-            6: 'sssppd',  # C
-            7: 'sssppd',  # N
-            8: 'sssppd',  # O
-            9: 'sssppd',  # F
-            15: 'sssspppd',  # P
-            16: 'sssspppd',  # S
+            1: 'ssp',  # H  (2s1p)
+            3: 'ssspp',  # Li (3s2p)
+            5: 'sssppd',  # B  (3s2p1d)
+            6: 'sssppd',  # C  (3s2p1d)
+            7: 'sssppd',  # N  (3s2p1d)
+            8: 'sssppd',  # O  (3s2p1d)
+            9: 'sssppd',  # F  (3s2p1d)
+            15: 'sssspppd',  # P  (4s3p1d)
+            16: 'sssspppd',  # S  (4s3p1d)
+            17: 'sssspppd',  # Cl (4s3p1d) <-- 新增
         },
         orbital_idx_map={'s': [0], 'p': [2, 0, 1], 'd': [0, 1, 2, 3, 4]},
         orbital_sign_map={'s': [1], 'p': [1, 1, 1], 'd': [1, 1, 1, 1, 1]},
@@ -89,6 +91,7 @@ convention_dict = {
             9: [0, 1, 2, 3, 4, 5],
             15: [0, 1, 2, 3, 4, 5, 6, 7],
             16: [0, 1, 2, 3, 4, 5, 6, 7],
+            17: [0, 1, 2, 3, 4, 5, 6, 7],  # Cl <-- 新增
         }
     ),
     'back_2_thu_pyscf': Namespace(

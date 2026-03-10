@@ -250,6 +250,17 @@ def criterion(outputs, target, names, flag=None, atoms=None, mol=None):
             mae = np.mean(np.abs(diff))
 
             if key in ["HOMO", "LUMO", "GAP"]:
+                # ================= 最小更改开始 =================
+                # 获取原始值 (Hartree)
+                raw_pred = float(outputs[key])
+                raw_label = float(target[key])
+
+                # 打印对比：显示 Ha 和转换后的 eV
+                print(f"[{key} DEBUG]")
+                print(f"  Pred : {raw_pred:.6f} Ha  =>  {raw_pred * Hartree:.6f} eV")
+                print(f"  Label: {raw_label:.6f} Ha  =>  {raw_label * Hartree:.6f} eV")
+                print(f"  Diff : {abs(raw_pred - raw_label):.6f} Ha  =>  {abs(raw_pred - raw_label) * Hartree:.6f} eV")
+                # ================= 最小更改结束 =================
                 mae = mae * Hartree
 
             error_dict[key] = mae
@@ -376,79 +387,6 @@ def process_dm_loss_dict(data, key="pred_vs_label"):
     return processed
 
 
-def get_electronic_properties(
-        mol, ham=None, overlap=None, dm=None, shifted_ham=None
-):
-    """
-    Helper function to extract electronic properties (Energies, Orbitals, Gap)
-    from either Hamiltonian+Overlap OR Density Matrix.
-    """
-    # 1. 准备 Hamiltonian 和 Overlap
-    if ham is None:
-        if dm is None:
-            raise ValueError("Must provide either Hamiltonian or Density Matrix")
-        mf = dft.RKS(mol)
-        mf.xc = "b3lyp"
-        # PySCF get_fock returns (N, N) for RKS usually, but let's handle potential (1, N, N)
-        ham = mf.get_fock(dm=dm)
-        if overlap is None:
-            overlap = mf.get_ovlp()
-
-    if overlap is None:
-        overlap = mol.intor("int1e_ovlp")
-
-    # 2. 规范化 Ham 和 Overlap 维度
-    # 先确保它们是 2D (N, N) 用于计算
-    ham_2d = ham
-    if ham.ndim == 3:
-        ham_2d = ham[0]  # Assume (1, N, N) -> (N, N)
-
-    ov_2d = overlap
-    if overlap.ndim == 3:
-        ov_2d = overlap[0]
-
-    # 3. 求解广义特征值问题 (使用 3D 输入适配函数)
-    # cal_orbital_and_energies 需要 (Batch, N, N) 输入
-    ham_in_3d = ham_2d[None, ...]  # Expand to (1, N, N)
-    ov_in_3d = ov_2d[None, ...]  # Expand to (1, N, N)
-
-    energies, coeffs = cal_orbital_and_energies(
-        overlap_matrix=ov_in_3d, full_hamiltonian=ham_in_3d
-    )
-
-    # 4. 确定占据数和索引
-    n_electrons = mol.tot_electrons()
-    homo_idx = int(n_electrons / 2) - 1
-    mo_occ = get_mo_occ(full_len=len(energies), occ_len=homo_idx + 1)
-
-    # 5. 处理 Shifted Ham (Criterion 期望 shifted_ham 是 2D (N, N))
-    if shifted_ham is None:
-        shifted_ham_2d = ham_2d
-    else:
-        shifted_ham_2d = shifted_ham
-        if shifted_ham_2d.ndim == 3:
-            shifted_ham_2d = shifted_ham_2d[0]
-
-    # 6. 打包结果
-    # 关键修正：Criterion 中的 'hamiltonian' 分支会执行 diff_matrix[0]，所以这里必须给 3D (1, N, N)
-    results = {
-        "HOMO": energies[homo_idx],
-        "LUMO": energies[homo_idx + 1],
-        "GAP": energies[homo_idx + 1] - energies[homo_idx],
-        "hamiltonian": ham_in_3d,  # (1, N, N)
-        "overlap": ov_in_3d,  # (1, N, N)
-        "shifted_ham": shifted_ham_2d,  # (N, N)
-        "density_matrix": dm
-        if dm is not None
-        else make_rdm1(mo_coeff=coeffs, mo_occ=mo_occ),
-        "mo_occ": mo_occ,
-        "orbital_coefficients": coeffs[:, : homo_idx + 1],
-        "HOMO_coefficients": coeffs[:, homo_idx],
-        "LUMO_coefficients": coeffs[:, homo_idx + 1],
-        "occupied_orbital_energy": energies[: homo_idx + 1],
-    }
-    return results
-
 
 def get_electron_number_from_dm(dm, overlap):
     """
@@ -471,291 +409,6 @@ def get_electron_number_from_dm(dm, overlap):
 
     return float(np.einsum("ij,ji->", P, S))
 
-
-def evaluate_dm_from_npy(
-        abs_ase_path,
-        npy_folder_path,
-        convention="def2svp",
-        mol_charge=0,
-        pred_dm_filename="predicted_dm.npy",
-        target_dm_filename="target_dm.npy",
-        transform_dm_flag=True,
-        get_esp_sta_flag=True,
-        get_ham_flag=True,
-        keep_xyz_file=True,
-        n_save_cube_items: int = 5,  # 新增：专门用于 generate_cube_files 的保存数量
-        temp_data_file: str = "temp_cube_data.pkl",  # 新增：保存路径
-        max_items: int = 300,
-        gen_esp_cube_flag: bool = False,
-        summary_filename="evaluation_summary.npz",
-):
-    import time
-    import json
-    import numpy as np
-    import traceback
-    import pickle  # 需要 pickle
-    from ase.db import connect
-    from ase.io import write
-    from tqdm import tqdm
-    import pyscf
-    from pyscf import tools
-
-    def format_number_local(x):
-        return "{:.6f}".format(x)
-
-    if convention == "6311gdp":
-        basis = "6-311+g(d,p)"
-        back_convention = "back_2_thu_pyscf"
-    elif convention == "back_thu_cluster":
-        basis = "def2svp"
-        back_convention = convention
-    else:
-        basis = "def2svp"
-        back_convention = "back2pyscf"
-
-    total_error_dict = {"total_items": 0, "pred_vs_label": {}}
-    start_time = time.time()
-    fail_count = 0
-    attempted_count = 0
-    failed_indices = []
-    summary_data_list = []
-
-    # 用于 generate_cube_files 的临时数据列表
-    temp_cube_data = []
-
-    def _load_npy_safe(path):
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Required file not found: {path}")
-        return np.load(path)
-
-    with connect(abs_ase_path) as db:
-        for idx, a_row in tqdm(enumerate(db.select())):
-            if idx == max_items:
-                break
-            attempted_count += 1
-            cwd_ = os.getcwd()
-            try:
-                work_dir = os.path.join(npy_folder_path, f"{idx}")
-                if not os.path.exists(work_dir):
-                    continue
-                os.chdir(work_dir)
-
-                atom_nums = a_row.numbers
-                an_atoms = a_row.toatoms()
-
-                pred_dm = _load_npy_safe(pred_dm_filename)
-                target_dm = _load_npy_safe(target_dm_filename)
-
-                if transform_dm_flag:
-                    pred_dm = matrix_transform(pred_dm, atom_nums, convention=back_convention)
-                    target_dm = matrix_transform(target_dm, atom_nums, convention=back_convention)
-
-                current_mol_charge = a_row.data.get("charge", mol_charge)
-
-                print('===============')
-                print('===============')
-                print(current_mol_charge)
-                print('===============')
-                print('===============')
-
-                sum_of_atomic_numbers = an_atoms.get_atomic_numbers().sum()
-                total_electrons = sum_of_atomic_numbers - current_mol_charge
-                mol_spin = total_electrons % 2
-
-                mol = pyscf.gto.Mole()
-                t = [
-                    [atom_nums[atom_idx], an_atom.position]
-                    for atom_idx, an_atom in enumerate(an_atoms)
-                ]
-                mol.charge = current_mol_charge
-                mol.spin = mol_spin
-                mol.build(verbose=0, atom=t, basis=basis, unit="ang")
-                overlap = mol.intor("int1e_ovlp")
-
-                # 计算由 DM 与 S 得到的电子数
-                expected_electrons = float(total_electrons)
-                Ne_pred = get_electron_number_from_dm(pred_dm, overlap)
-                Ne_target = get_electron_number_from_dm(target_dm, overlap)
-
-                # 1. 基础误差 (Density Matrix & Dipole)
-                errors = calculate_dm_dipole_mae(pred_dm, target_dm, mol)
-
-                # --- NEW: Calculate Block Diagonal/Non-Diagonal MAE for Density Matrix ---
-                _, atom_in_mo_indices = generate_molecule_transform_indices(
-                    atom_types=an_atoms.get_chemical_symbols(),
-                    atom_to_transform_indices=atom_to_transform_indices,
-                )
-                # Recalculate diff locally to split it
-                dm_diff = np.abs(pred_dm - target_dm)
-                dm_diag, dm_non_diag = cut_and_cal_matrix(
-                    full_matrix=dm_diff,
-                    atom_in_mo_indices=atom_in_mo_indices
-                )
-                errors["diagonal_density_matrix_mae"] = dm_diag
-                errors["non_diagonal_density_matrix_mae"] = dm_non_diag
-                # -----------------------------------------------------------------------
-
-                # 1b. 新增：电子数守恒相关误差
-                errors["pred_electron_number_error"] = abs(Ne_pred - expected_electrons)
-                errors["target_electron_number_error"] = abs(
-                    Ne_target - expected_electrons
-                )
-                errors["electron_number_pred_vs_target_error"] = abs(
-                    Ne_pred - Ne_target
-                )
-
-                # 2. (可选) 计算 DM 推导出的 Hamiltonian 误差及轨道相似度
-                if get_ham_flag:
-                    pred_props = get_electronic_properties(
-                        mol, dm=pred_dm, overlap=overlap
-                    )
-                    target_props = get_electronic_properties(
-                        mol, dm=target_dm, overlap=overlap
-                    )
-
-                    eval_keys = [
-                        "hamiltonian",
-                        "HOMO",
-                        "LUMO",
-                        "GAP",
-                        "orbital_coefficients",
-                        "HOMO_coefficients",
-                        "LUMO_coefficients",
-                    ]
-
-                    # Note: criterion will handle diagonal/non-diagonal for hamiltonian
-                    # because we pass 'atoms=an_atoms' and key 'hamiltonian' is in eval_keys.
-                    ham_orb_errors = criterion(
-                        pred_props,
-                        target_props,
-                        eval_keys,
-                        flag=False,
-                        atoms=an_atoms,
-                        mol=mol,
-                    )
-                    errors.update(ham_orb_errors)
-
-                    # --- 保存用于 generate_cube_files 的数据 ---
-                    if idx < n_save_cube_items:
-                        # 构建 mol_info 用于重建 PySCF Mole
-                        mol_info = {
-                            "atom_nums": [int(x) for x in atom_nums],
-                            "atom_coords": [list(at.position) for at in an_atoms],
-                            "charge": int(current_mol_charge),
-                            "spin": int(mol_spin),
-                            "basis": basis,
-                            "unit": "ang",
-                        }
-
-                        # 构建单个 item 数据
-                        cube_item = {
-                            "idx": idx,
-                            "HOMO_sim": errors.get("HOMO_coefficients", 0.0),
-                            "mol_info": mol_info,
-                            "outputs": pred_props,
-                            "tgt_info": target_props,
-                        }
-                        temp_cube_data.append(cube_item)
-                    # ----------------------------------------------------
-
-                print(errors)
-
-                # 3. 计算 ESP 和 Deformation Factor
-                if get_esp_sta_flag:
-                    p_esp_max, p_esp_min, p_phi = calculate_properties_from_dm(
-                        mol, pred_dm, "pred", gen_dm_flag=gen_esp_cube_flag
-                    )
-                    t_esp_max, t_esp_min, t_phi = calculate_properties_from_dm(
-                        mol, target_dm, "target", gen_dm_flag=gen_esp_cube_flag
-                    )
-                    errors["esp_max_mae"] = abs(t_esp_max - p_esp_max)
-                    errors["esp_min_mae"] = abs(t_esp_min - p_esp_min)
-                    if p_phi is not None and t_phi is not None:
-                        errors["deformation_factor_mae"] = abs(p_phi - t_phi)
-                    else:
-                        errors["deformation_factor_mae"] = None
-
-                if keep_xyz_file:
-                    write("atomic_structure.xyz", an_atoms)
-
-                for key, val in errors.items():
-                    if val is not None:
-                        total_error_dict["pred_vs_label"][key] = (
-                                total_error_dict["pred_vs_label"].get(key, 0.0) + val
-                        )
-
-                total_error_dict["total_items"] += 1
-
-                mol_info_log = {
-                    "formula": an_atoms.get_chemical_formula(),
-                    "charge": int(current_mol_charge),
-                    "spin": int(mol_spin),
-                }
-                local_result = {"idx": idx, "mol_info": mol_info_log, "errors": errors}
-                with open("dm_evaluation_result.json", "w") as f_json:
-                    json.dump(local_result, f_json, indent=4, default=str)
-
-                flat_data = {"idx": idx}
-                flat_data.update(errors)
-                summary_data_list.append(flat_data)
-
-            except Exception as e:
-                fail_count += 1
-                failed_indices.append(idx)
-                traceback.print_exc()
-                print(f"[evaluate_dm_from_npy] idx {idx} failed: {repr(e)}")
-            finally:
-                os.chdir(cwd_)
-
-    # 循环结束后，保存 temp_cube_data
-    if temp_data_file and len(temp_cube_data) > 0:
-        save_path = os.path.join(npy_folder_path, temp_data_file)
-        try:
-            with open(save_path, "wb") as f:
-                pickle.dump(temp_cube_data, f)
-            print(
-                f"[evaluate_dm_from_npy] Saved cube info for {len(temp_cube_data)} items to {save_path}"
-            )
-        except Exception as e:
-            print(f"[evaluate_dm_from_npy] Failed to save temp cube data: {e}")
-
-    n = total_error_dict["total_items"]
-    if n > 0:
-        for key in total_error_dict["pred_vs_label"].keys():
-            total_error_dict["pred_vs_label"][key] /= n
-
-    end_time = time.time()
-    total_error_dict["second_per_item"] = (end_time - start_time) / max(1, n)
-
-    if len(summary_data_list) > 0:
-        all_keys = set().union(*(d.keys() for d in summary_data_list))
-        npz_dict = {}
-        for key in all_keys:
-            values = []
-            for item in summary_data_list:
-                val = item.get(key, np.nan)
-                if val is None:
-                    val = np.nan
-                values.append(val)
-            npz_dict[key] = np.array(values)
-        np.savez(os.path.join(npy_folder_path, summary_filename), **npz_dict)
-
-    final_data_to_process = {
-        "pred_vs_label": total_error_dict["pred_vs_label"].copy()
-    }
-    final_data_to_process["pred_vs_label"]["second_per_item"] = total_error_dict[
-        "second_per_item"
-    ]
-
-    result_dict = process_dm_loss_dict(final_data_to_process, key="pred_vs_label")
-    result_dict["Total Items"] = n
-    result_dict["Attempted Items"] = attempted_count
-    result_dict["Failed Items"] = fail_count
-
-    print(
-        f"[evaluate_dm_from_npy] Attempted: {attempted_count}, Success: {n}, Failed: {fail_count}"
-    )
-    return result_dict
 
 
 def prepare_np(
@@ -783,180 +436,6 @@ def prepare_np(
         )
     return full_hamiltonian, overlap_matrix
 
-
-def get_mae_from_npy(
-        abs_ase_path,
-        npy_folder_path,
-        temp_data_file=None,
-        united_overlap_flag=False,
-        convention="def2svp",
-        mol_charge=0,
-        save_summary=False,
-        full_save_items=10,
-):
-    import pickle
-
-    if convention == "6311gdp":
-        basis = "6-311+g(d,p)"
-        back_convention = "back_2_thu_pyscf"
-    else:
-        basis = "def2svp"
-        back_convention = "back2pyscf"
-
-    total_error_dict = {"total_items": 0, "pred_vs_label": {}}
-    start_time = time.time()
-    temp_data = []
-
-    def _load_npy_safe(path):
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Required file not found: {path}")
-        return np.load(path)
-
-    with connect(abs_ase_path) as db:
-        for idx, a_row in tqdm(enumerate(db.select())):
-            atom_nums = a_row.numbers
-            an_atoms = a_row.toatoms()
-            total_error_dict["total_items"] += 1
-
-            pred_ham = _load_npy_safe(
-                os.path.join(npy_folder_path, f"{idx}", "predicted_ham.npy")
-            )
-            orig_ham = _load_npy_safe(
-                os.path.join(npy_folder_path, f"{idx}", "original_ham.npy")
-            )
-
-            mol = pyscf.gto.Mole()
-            t = [
-                [atom_nums[atom_idx], an_atom.position]
-                for atom_idx, an_atom in enumerate(an_atoms)
-            ]
-            mol_charge = a_row.data.get("charge", mol_charge)
-            mol.charge = mol_charge
-            sum_of_atomic_numbers = an_atoms.get_atomic_numbers().sum()
-            total_electrons = sum_of_atomic_numbers - mol_charge
-            mol_spin = total_electrons % 2
-            mol.spin = mol_spin
-            mol.build(verbose=0, atom=t, basis=basis, unit="ang")
-
-            # 准备矩阵数据
-            shifted_label_ham = None  # 默认 None
-
-            if not united_overlap_flag:
-                pred_ov = _load_npy_safe(
-                    os.path.join(npy_folder_path, f"{idx}", "predicted_overlap.npy")
-                )
-                orig_ov = _load_npy_safe(
-                    os.path.join(npy_folder_path, f"{idx}", "original_overlap.npy")
-                )
-
-                orig_ham_prep, orig_ov_prep = prepare_np(
-                    atom_symbols=atom_nums,
-                    overlap_matrix=orig_ov,
-                    full_hamiltonian=orig_ham,
-                    transform_ham_flag=True,
-                    transform_overlap_flag=True,
-                    convention=convention,
-                )
-                pred_ham_prep, pred_ov_prep = prepare_np(
-                    atom_symbols=atom_nums,
-                    overlap_matrix=pred_ov,
-                    full_hamiltonian=pred_ham,
-                    transform_ham_flag=True,
-                    transform_overlap_flag=True,
-                    convention=convention,
-                )
-            else:
-                orig_ham_bt = matrix_transform(
-                    orig_ham, atom_nums, convention=back_convention
-                )
-                pred_ham_bt = matrix_transform(
-                    pred_ham, atom_nums, convention=back_convention
-                )
-                target_overlap = mol.intor("int1e_ovlp")
-
-                # 计算 Shifted Ham (仅针对 Target)
-                shifted_label_ham = get_shifted_ham(
-                    predicted_ham=pred_ham_bt,
-                    label_ham=orig_ham_bt,
-                    overlap=target_overlap,
-                )
-
-                orig_ham_prep, orig_ov_prep = prepare_np(
-                    atom_symbols=atom_nums,
-                    overlap_matrix=target_overlap,
-                    full_hamiltonian=orig_ham_bt,
-                    transform_ham_flag=False,
-                    transform_overlap_flag=False,
-                    convention=convention,
-                )
-                pred_ham_prep, pred_ov_prep = prepare_np(
-                    atom_symbols=atom_nums,
-                    overlap_matrix=target_overlap,
-                    full_hamiltonian=pred_ham_bt,
-                    transform_ham_flag=False,
-                    transform_overlap_flag=False,
-                    convention=convention,
-                )
-
-            # --- 使用 Helper 函数获取属性 ---
-            # prepare_np 返回的是 (1, N, N) 的 3D 数组，Helper 会处理
-            outputs = get_electronic_properties(
-                mol, ham=pred_ham_prep, overlap=pred_ov_prep
-            )
-            tgt_info = get_electronic_properties(
-                mol,
-                ham=orig_ham_prep,
-                overlap=orig_ov_prep,
-                shifted_ham=shifted_label_ham,
-            )
-
-            # 计算误差
-            pred_vs_label = criterion(
-                outputs, tgt_info, list(outputs.keys()), flag=False, atoms=an_atoms, mol=mol
-            )
-            for key, val in pred_vs_label.items():
-                total_error_dict["pred_vs_label"][key] = (
-                        total_error_dict["pred_vs_label"].get(key, 0.0) + val
-                )
-
-            if save_summary:
-                mol_info = {
-                    "atom_nums": [int(x) for x in atom_nums],
-                    "atom_coords": [list(at.position) for at in an_atoms],
-                    "charge": mol_charge,
-                    "spin": mol_spin,
-                    "basis": basis,
-                    "unit": "ang",
-                }
-                item_data = {
-                    "mol_info": mol_info,
-                    "pred_vs_label": pred_vs_label,
-                    "HOMO_sim": pred_vs_label["HOMO_coefficients"],
-                    "idx": idx,
-                }
-                if idx < full_save_items:
-                    item_data.update({"outputs": outputs, "tgt_info": tgt_info})
-                temp_data.append(item_data)
-
-    n = total_error_dict["total_items"]
-    if n > 0:
-        for key in total_error_dict["pred_vs_label"].keys():
-            total_error_dict["pred_vs_label"][key] = (
-                    total_error_dict["pred_vs_label"][key] / n
-            )
-
-    end_time = time.time()
-    total_error_dict["second_per_item"] = (end_time - start_time) / max(1, n)
-
-    total_error_dict = process_loss_dict(total_error_dict, key="pred_vs_label")
-
-    print(total_error_dict)
-
-    if save_summary and temp_data_file is not None:
-        with open(temp_data_file, "wb") as f:
-            pickle.dump(temp_data, f)
-
-    return total_error_dict
 
 
 
@@ -1112,10 +591,505 @@ def find_best_dm_transform_permutation(
     if "temp_perm_search" in convention_dict:
         del convention_dict["temp_perm_search"]
 
-# 使用示例 (请根据实际路径调用):
-# find_best_dm_transform_permutation(
-#     abs_ase_path="path/to/test.db",
-#     npy_folder_path="path/to/npy",
-#     basis_set="def2svp",  # 或 "6-311+g(d,p)"
-#     base_convention="back2pyscf" # 选择一个原子轨道结构(ssp vs sssp)与你目标一致的作为模板
-# )
+
+def get_electronic_properties(
+        mol, ham=None, overlap=None, dm=None, shifted_ham=None, pcm_eps=None
+):
+    """
+    Helper function to extract electronic properties (Energies, Orbitals, Gap)
+    from either Hamiltonian+Overlap OR Density Matrix.
+
+    Updated to support PCM solvent model via pcm_eps.
+    """
+    # 1. 准备 Hamiltonian 和 Overlap
+    if ham is None:
+        if dm is None:
+            raise ValueError("Must provide either Hamiltonian or Density Matrix")
+
+        mf = dft.RKS(mol)
+        mf.xc = "b3lyp"
+
+        # --- Add PCM (Solvent) Model if requested ---
+        if pcm_eps is not None and pcm_eps > 1.0:
+            mf = mf.ddCOSMO()
+            mf.with_solvent.eps = pcm_eps
+
+        # PySCF get_fock returns (N, N) for RKS usually, but let's handle potential (1, N, N)
+        # With PCM enabled, get_fock includes: H_core + J + K + V_pcm
+        ham = mf.get_fock(dm=dm)
+
+        if overlap is None:
+            overlap = mf.get_ovlp()
+
+    if overlap is None:
+        overlap = mol.intor("int1e_ovlp")
+
+    # 2. 规范化 Ham 和 Overlap 维度
+    # 先确保它们是 2D (N, N) 用于计算
+    ham_2d = ham
+    if ham.ndim == 3:
+        ham_2d = ham[0]  # Assume (1, N, N) -> (N, N)
+
+    ov_2d = overlap
+    if overlap.ndim == 3:
+        ov_2d = overlap[0]
+
+    # 3. 求解广义特征值问题 (使用 3D 输入适配函数)
+    # cal_orbital_and_energies 需要 (Batch, N, N) 输入
+    ham_in_3d = ham_2d[None, ...]  # Expand to (1, N, N)
+    ov_in_3d = ov_2d[None, ...]  # Expand to (1, N, N)
+
+    energies, coeffs = cal_orbital_and_energies(
+        overlap_matrix=ov_in_3d, full_hamiltonian=ham_in_3d
+    )
+
+    # 4. 确定占据数和索引
+    n_electrons = mol.tot_electrons()
+    homo_idx = int(n_electrons / 2) - 1
+    mo_occ = get_mo_occ(full_len=len(energies), occ_len=homo_idx + 1)
+
+    # 5. 处理 Shifted Ham (Criterion 期望 shifted_ham 是 2D (N, N))
+    if shifted_ham is None:
+        shifted_ham_2d = ham_2d
+    else:
+        shifted_ham_2d = shifted_ham
+        if shifted_ham_2d.ndim == 3:
+            shifted_ham_2d = shifted_ham_2d[0]
+
+    # 6. 打包结果
+    results = {
+        "HOMO": energies[homo_idx],
+        "LUMO": energies[homo_idx + 1],
+        "GAP": energies[homo_idx + 1] - energies[homo_idx],
+        "hamiltonian": ham_in_3d,  # (1, N, N)
+        "overlap": ov_in_3d,  # (1, N, N)
+        "shifted_ham": shifted_ham_2d,  # (N, N)
+        "density_matrix": dm if dm is not None else make_rdm1(mo_coeff=coeffs, mo_occ=mo_occ),
+        "mo_occ": mo_occ,
+        "orbital_coefficients": coeffs[:, : homo_idx + 1],
+        "HOMO_coefficients": coeffs[:, homo_idx],
+        "LUMO_coefficients": coeffs[:, homo_idx + 1],
+        "occupied_orbital_energy": energies[: homo_idx + 1],
+    }
+    return results
+
+
+def evaluate_dm_from_npy(
+        abs_ase_path,
+        npy_folder_path,
+        convention="def2svp",
+        mol_charge=0,
+        pred_dm_filename="predicted_dm.npy",
+        target_dm_filename="target_dm.npy",
+        transform_dm_flag=True,
+        get_esp_sta_flag=True,
+        get_ham_flag=True,
+        keep_xyz_file=True,
+        n_save_cube_items: int = 5,
+        temp_data_file: str = "temp_cube_data.pkl",
+        max_items: int = 300,
+        gen_esp_cube_flag: bool = False,
+        summary_filename="evaluation_summary.npz",
+        pcm_eps: float = 25,  # Default solvent epsilon
+):
+    import time
+    import json
+    import numpy as np
+    import traceback
+    import pickle
+    from ase.db import connect
+    from ase.io import write
+    from tqdm import tqdm
+    import pyscf
+
+    def format_number_local(x):
+        return "{:.6f}".format(x)
+
+    if convention == "6311gdp":
+        basis = "6-311+g(d,p)"
+        back_convention = "back_2_thu_pyscf"
+    elif convention == "back_thu_cluster":
+        basis = "def2svp"
+        back_convention = convention
+    else:
+        basis = "def2svp"
+        back_convention = "back2pyscf"
+
+    total_error_dict = {"total_items": 0, "pred_vs_label": {}}
+    start_time = time.time()
+    fail_count = 0
+    attempted_count = 0
+    failed_indices = []
+    summary_data_list = []
+    temp_cube_data = []
+
+    def _load_npy_safe(path):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Required file not found: {path}")
+        return np.load(path)
+
+    with connect(abs_ase_path) as db:
+        for idx, a_row in tqdm(enumerate(db.select())):
+            if idx == max_items:
+                break
+            attempted_count += 1
+            cwd_ = os.getcwd()
+            try:
+                work_dir = os.path.join(npy_folder_path, f"{idx}")
+                if not os.path.exists(work_dir):
+                    continue
+                os.chdir(work_dir)
+
+                atom_nums = a_row.numbers
+                an_atoms = a_row.toatoms()
+
+                pred_dm = _load_npy_safe(pred_dm_filename)
+                target_dm = _load_npy_safe(target_dm_filename)
+
+                if transform_dm_flag:
+                    pred_dm = matrix_transform(pred_dm, atom_nums, convention=back_convention)
+                    target_dm = matrix_transform(target_dm, atom_nums, convention=back_convention)
+
+                current_mol_charge = a_row.data.get("charge", mol_charge)
+
+                sum_of_atomic_numbers = an_atoms.get_atomic_numbers().sum()
+                total_electrons = sum_of_atomic_numbers - current_mol_charge
+                mol_spin = total_electrons % 2
+
+                mol = pyscf.gto.Mole()
+                t = [
+                    [atom_nums[atom_idx], an_atom.position]
+                    for atom_idx, an_atom in enumerate(an_atoms)
+                ]
+                mol.charge = current_mol_charge
+                mol.spin = mol_spin
+                mol.build(verbose=0, atom=t, basis=basis, unit="ang")
+                overlap = mol.intor("int1e_ovlp")
+
+                expected_electrons = float(total_electrons)
+                Ne_pred = get_electron_number_from_dm(pred_dm, overlap)
+                Ne_target = get_electron_number_from_dm(target_dm, overlap)
+
+                # 1. 基础误差
+                errors = calculate_dm_dipole_mae(pred_dm, target_dm, mol)
+
+                _, atom_in_mo_indices = generate_molecule_transform_indices(
+                    atom_types=an_atoms.get_chemical_symbols(),
+                    atom_to_transform_indices=atom_to_transform_indices,
+                )
+                dm_diff = np.abs(pred_dm - target_dm)
+                dm_diag, dm_non_diag = cut_and_cal_matrix(
+                    full_matrix=dm_diff,
+                    atom_in_mo_indices=atom_in_mo_indices
+                )
+                errors["diagonal_density_matrix_mae"] = dm_diag
+                errors["non_diagonal_density_matrix_mae"] = dm_non_diag
+
+                errors["pred_electron_number_error"] = abs(Ne_pred - expected_electrons)
+                errors["target_electron_number_error"] = abs(Ne_target - expected_electrons)
+                errors["electron_number_pred_vs_target_error"] = abs(Ne_pred - Ne_target)
+
+                # 2. 计算 DM 推导出的 Hamiltonian 误差及轨道 (含 PCM 支持)
+                if get_ham_flag:
+                    # print(pcm_eps)
+                    pcm_eps = a_row.data.get("dielectric_constant", pcm_eps)
+                    # print(pcm_eps)
+                    # 将 pcm_eps 传入，使 get_fock 包含溶剂势
+                    pred_props = get_electronic_properties(
+                        mol, dm=pred_dm, overlap=overlap, pcm_eps=pcm_eps
+                    )
+                    target_props = get_electronic_properties(
+                        mol, dm=target_dm, overlap=overlap, pcm_eps=pcm_eps
+                    )
+
+                    eval_keys = [
+                        "hamiltonian", "HOMO", "LUMO", "GAP",
+                        "orbital_coefficients", "HOMO_coefficients", "LUMO_coefficients",
+                    ]
+
+                    ham_orb_errors = criterion(
+                        pred_props,
+                        target_props,
+                        eval_keys,
+                        flag=False,
+                        atoms=an_atoms,
+                        mol=mol,
+                    )
+                    errors.update(ham_orb_errors)
+
+                    if idx < n_save_cube_items:
+                        mol_info = {
+                            "atom_nums": [int(x) for x in atom_nums],
+                            "atom_coords": [list(at.position) for at in an_atoms],
+                            "charge": int(current_mol_charge),
+                            "spin": int(mol_spin),
+                            "basis": basis,
+                            "unit": "ang",
+                        }
+                        cube_item = {
+                            "idx": idx,
+                            "HOMO_sim": errors.get("HOMO_coefficients", 0.0),
+                            "mol_info": mol_info,
+                            "outputs": pred_props,
+                            "tgt_info": target_props,
+                        }
+                        temp_cube_data.append(cube_item)
+
+                print(errors)
+
+                # 3. 计算 ESP (通常 ESP 仍基于真空气相或特定后处理，此处保留原逻辑)
+                if get_esp_sta_flag:
+                    p_esp_max, p_esp_min, p_phi = calculate_properties_from_dm(
+                        mol, pred_dm, "pred", gen_dm_flag=gen_esp_cube_flag
+                    )
+                    t_esp_max, t_esp_min, t_phi = calculate_properties_from_dm(
+                        mol, target_dm, "target", gen_dm_flag=gen_esp_cube_flag
+                    )
+                    errors["esp_max_mae"] = abs(t_esp_max - p_esp_max)
+                    errors["esp_min_mae"] = abs(t_esp_min - p_esp_min)
+                    if p_phi is not None and t_phi is not None:
+                        errors["deformation_factor_mae"] = abs(p_phi - t_phi)
+                    else:
+                        errors["deformation_factor_mae"] = None
+
+                if keep_xyz_file:
+                    write("atomic_structure.xyz", an_atoms)
+
+                for key, val in errors.items():
+                    if val is not None:
+                        total_error_dict["pred_vs_label"][key] = (
+                                total_error_dict["pred_vs_label"].get(key, 0.0) + val
+                        )
+
+                total_error_dict["total_items"] += 1
+
+                # Save Logs
+                mol_info_log = {
+                    "formula": an_atoms.get_chemical_formula(),
+                    "charge": int(current_mol_charge),
+                    "spin": int(mol_spin),
+                }
+                local_result = {"idx": idx, "mol_info": mol_info_log, "errors": errors}
+                with open("dm_evaluation_result.json", "w") as f_json:
+                    json.dump(local_result, f_json, indent=4, default=str)
+
+                flat_data = {"idx": idx}
+                flat_data.update(errors)
+                summary_data_list.append(flat_data)
+
+            except Exception as e:
+                fail_count += 1
+                failed_indices.append(idx)
+                traceback.print_exc()
+                print(f"[evaluate_dm_from_npy] idx {idx} failed: {repr(e)}")
+            finally:
+                os.chdir(cwd_)
+
+    if temp_data_file and len(temp_cube_data) > 0:
+        save_path = os.path.join(npy_folder_path, temp_data_file)
+        try:
+            with open(save_path, "wb") as f:
+                pickle.dump(temp_cube_data, f)
+        except Exception as e:
+            print(f"[evaluate_dm_from_npy] Failed to save temp cube data: {e}")
+
+    n = total_error_dict["total_items"]
+    if n > 0:
+        for key in total_error_dict["pred_vs_label"].keys():
+            total_error_dict["pred_vs_label"][key] /= n
+
+    end_time = time.time()
+    total_error_dict["second_per_item"] = (end_time - start_time) / max(1, n)
+
+    if len(summary_data_list) > 0:
+        all_keys = set().union(*(d.keys() for d in summary_data_list))
+        npz_dict = {}
+        for key in all_keys:
+            values = []
+            for item in summary_data_list:
+                values.append(item.get(key, np.nan))
+            npz_dict[key] = np.array(values)
+        np.savez(os.path.join(npy_folder_path, summary_filename), **npz_dict)
+
+    final_data = {"pred_vs_label": total_error_dict["pred_vs_label"].copy()}
+    final_data["pred_vs_label"]["second_per_item"] = total_error_dict["second_per_item"]
+
+    result_dict = process_dm_loss_dict(final_data, key="pred_vs_label")
+    result_dict.update({
+        "Total Items": n,
+        "Attempted Items": attempted_count,
+        "Failed Items": fail_count
+    })
+    return result_dict
+
+
+def get_mae_from_npy(
+        abs_ase_path,
+        npy_folder_path,
+        temp_data_file=None,
+        united_overlap_flag=False,
+        convention="def2svp",
+        mol_charge=0,
+        save_summary=False,
+        full_save_items=10,
+        pcm_eps: float = 25.59,  # Default solvent epsilon
+):
+    import pickle
+
+    if convention == "6311gdp":
+        basis = "6-311+g(d,p)"
+        back_convention = "back_2_thu_pyscf"
+    else:
+        basis = "def2svp"
+        back_convention = "back2pyscf"
+
+    total_error_dict = {"total_items": 0, "pred_vs_label": {}}
+    start_time = time.time()
+    temp_data = []
+
+    def _load_npy_safe(path):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Required file not found: {path}")
+        return np.load(path)
+
+    with connect(abs_ase_path) as db:
+        for idx, a_row in tqdm(enumerate(db.select())):
+            atom_nums = a_row.numbers
+            an_atoms = a_row.toatoms()
+            total_error_dict["total_items"] += 1
+
+            pred_ham = _load_npy_safe(
+                os.path.join(npy_folder_path, f"{idx}", "predicted_ham.npy")
+            )
+            orig_ham = _load_npy_safe(
+                os.path.join(npy_folder_path, f"{idx}", "original_ham.npy")
+            )
+
+            mol = pyscf.gto.Mole()
+            t = [
+                [atom_nums[atom_idx], an_atom.position]
+                for atom_idx, an_atom in enumerate(an_atoms)
+            ]
+            mol_charge = a_row.data.get("charge", mol_charge)
+            mol.charge = mol_charge
+            sum_of_atomic_numbers = an_atoms.get_atomic_numbers().sum()
+            total_electrons = sum_of_atomic_numbers - mol_charge
+            mol_spin = total_electrons % 2
+            mol.spin = mol_spin
+            mol.build(verbose=0, atom=t, basis=basis, unit="ang")
+
+            shifted_label_ham = None
+
+            if not united_overlap_flag:
+                pred_ov = _load_npy_safe(
+                    os.path.join(npy_folder_path, f"{idx}", "predicted_overlap.npy")
+                )
+                orig_ov = _load_npy_safe(
+                    os.path.join(npy_folder_path, f"{idx}", "original_overlap.npy")
+                )
+                orig_ham_prep, orig_ov_prep = prepare_np(
+                    atom_symbols=atom_nums,
+                    overlap_matrix=orig_ov,
+                    full_hamiltonian=orig_ham,
+                    transform_ham_flag=True,
+                    transform_overlap_flag=True,
+                    convention=convention,
+                )
+                pred_ham_prep, pred_ov_prep = prepare_np(
+                    atom_symbols=atom_nums,
+                    overlap_matrix=pred_ov,
+                    full_hamiltonian=pred_ham,
+                    transform_ham_flag=True,
+                    transform_overlap_flag=True,
+                    convention=convention,
+                )
+            else:
+                orig_ham_bt = matrix_transform(
+                    orig_ham, atom_nums, convention=back_convention
+                )
+                pred_ham_bt = matrix_transform(
+                    pred_ham, atom_nums, convention=back_convention
+                )
+                target_overlap = mol.intor("int1e_ovlp")
+
+                shifted_label_ham = get_shifted_ham(
+                    predicted_ham=pred_ham_bt,
+                    label_ham=orig_ham_bt,
+                    overlap=target_overlap,
+                )
+
+                orig_ham_prep, orig_ov_prep = prepare_np(
+                    atom_symbols=atom_nums,
+                    overlap_matrix=target_overlap,
+                    full_hamiltonian=orig_ham_bt,
+                    transform_ham_flag=False,
+                    transform_overlap_flag=False,
+                    convention=convention,
+                )
+                pred_ham_prep, pred_ov_prep = prepare_np(
+                    atom_symbols=atom_nums,
+                    overlap_matrix=target_overlap,
+                    full_hamiltonian=pred_ham_bt,
+                    transform_ham_flag=False,
+                    transform_overlap_flag=False,
+                    convention=convention,
+                )
+
+            # --- 使用 Helper 函数获取属性 (传入 pcm_eps) ---
+            # 注: 如果传入了明确的 ham, get_electronic_properties 内部其实不会重新构建 Fock，
+            # 而是直接使用传入的 ham。这里传入 pcm_eps 主要是为了 API 统一性以及如果内部有
+            # 基于 mf 的操作时能保持一致。
+            outputs = get_electronic_properties(
+                mol, ham=pred_ham_prep, overlap=pred_ov_prep, pcm_eps=pcm_eps
+            )
+            tgt_info = get_electronic_properties(
+                mol,
+                ham=orig_ham_prep,
+                overlap=orig_ov_prep,
+                shifted_ham=shifted_label_ham,
+                pcm_eps=pcm_eps
+            )
+
+            pred_vs_label = criterion(
+                outputs, tgt_info, list(outputs.keys()), flag=False, atoms=an_atoms, mol=mol
+            )
+            for key, val in pred_vs_label.items():
+                total_error_dict["pred_vs_label"][key] = (
+                        total_error_dict["pred_vs_label"].get(key, 0.0) + val
+                )
+
+            if save_summary:
+                mol_info = {
+                    "atom_nums": [int(x) for x in atom_nums],
+                    "atom_coords": [list(at.position) for at in an_atoms],
+                    "charge": mol_charge,
+                    "spin": mol_spin,
+                    "basis": basis,
+                    "unit": "ang",
+                }
+                item_data = {
+                    "mol_info": mol_info,
+                    "pred_vs_label": pred_vs_label,
+                    "HOMO_sim": pred_vs_label["HOMO_coefficients"],
+                    "idx": idx,
+                }
+                if idx < full_save_items:
+                    item_data.update({"outputs": outputs, "tgt_info": tgt_info})
+                temp_data.append(item_data)
+
+    n = total_error_dict["total_items"]
+    if n > 0:
+        for key in total_error_dict["pred_vs_label"].keys():
+            total_error_dict["pred_vs_label"][key] /= n
+
+    end_time = time.time()
+    total_error_dict["second_per_item"] = (end_time - start_time) / max(1, n)
+
+    total_error_dict = process_loss_dict(total_error_dict, key="pred_vs_label")
+    print(total_error_dict)
+
+    if save_summary and temp_data_file is not None:
+        with open(temp_data_file, "wb") as f:
+            pickle.dump(temp_data, f)
+
+    return total_error_dict
