@@ -3,8 +3,12 @@ import time
 import pickle
 import json
 
+
+os.environ['PYSCF_MAX_MEMORY'] = '32000'
+
 import numpy as np
 import pyscf
+
 import torch
 from ase.io import write
 from ase.db.core import connect
@@ -24,6 +28,34 @@ from emoles.utils import (
     generate_molecule_transform_indices,
 )
 from emoles.inference.common_tools import calculate_esp_from_dm
+from pyscf.data import radii
+
+# ============================================================
+# UFF VDW 半径表 (Å) - 对齐 Gaussian Radii=UFF
+# ============================================================
+UFF_RADII_ANG = {
+    1: 1.4430,   2: 1.1810,   3: 1.2255,   4: 1.3725,   5: 1.8150,
+    6: 1.9255,   7: 1.8300,   8: 1.7500,   9: 1.6820,  10: 1.6215,
+   11: 1.4915,  12: 1.5105,  13: 2.2495,  14: 2.1475,  15: 2.0735,
+   16: 2.0175,  17: 2.0450,  18: 1.9340,  19: 1.9060,  20: 1.6995,
+   21: 1.6475,  22: 1.5875,  23: 1.5720,  24: 1.5115,  25: 1.4805,
+   26: 1.4560,  27: 1.4360,  28: 1.4170,  29: 1.7475,  30: 1.3815,
+   31: 2.1915,  32: 2.1400,  33: 2.1150,  34: 2.1025,  35: 2.1650,
+   36: 2.0200,  37: 2.2585,  38: 2.0515,  39: 1.8245,  40: 1.6155,
+   41: 1.5720,  42: 1.5260,  43: 1.4990,  44: 1.4815,  45: 1.4645,
+   46: 1.4495,  47: 1.5740,  48: 1.4240,  49: 2.2315,  50: 2.1960,
+   51: 2.2100,  52: 2.2350,  53: 2.3600,  54: 2.1815,
+}
+
+BOHR = radii.BOHR  # 0.52917721092
+
+
+def build_uff_radii_table():
+    """UFF 半径 (Bohr)，未含缩放因子"""
+    table = np.zeros(118)
+    for z, r in UFF_RADII_ANG.items():
+        table[z] = r / BOHR
+    return table
 
 
 def calculate_dm_dipole_mae(pred_dm, target_dm, mol):
@@ -39,107 +71,6 @@ def calculate_dm_dipole_mae(pred_dm, target_dm, mol):
     dip_target = get_dipole_info(mol, target_dm)
     error_dict["dipole"] = np.abs(np.array(dip_pred - dip_target))
     return error_dict
-
-
-def calculate_properties_from_dm(mol, dm, prefix, gen_dm_flag=False):
-    """
-    A helper function to:
-    1. Generate an fchk file from a density matrix via mokit.
-    2. Compute ESP properties using Multiwfn.
-    3. Compute Deformation Factor (phi) for the first Li atom found.
-
-    Parameters:
-    -----------
-    mol : gto.Mole
-        PySCF molecule object.
-    dm : np.ndarray
-        Density matrix.
-    prefix : str
-        A prefix for all output files (e.g., "pred", "target").
-        Also used to name the Li PDB file (e.g. Li_pred_1_...).
-
-    Returns:
-    --------
-    tuple
-        (ESP_max_in_eV, ESP_min_in_eV, deformation_factor)
-        deformation_factor is a float (phi) or None if calculation fails/no Li.
-    """
-    import json
-    from mokit.lib.py2fch_direct import fchk
-    from pyscf import dft
-    from emoles.multiwfn import ESPCalculator, ELFDeformationCalculator
-
-    # 1. Set up and run PySCF DFT calculation from the density matrix
-    mf = dft.RKS(mol)
-    mf.xc = "b3lyp"
-    fock = mf.get_fock(dm=dm)
-    s = mf.get_ovlp()
-    orbital_energies, orbital_coefficients = mf.eig(fock, s)
-    mf.mo_energy = orbital_energies
-    mf.mo_coeff = orbital_coefficients
-    mf.dm = dm
-
-    # 2. Generate fchk file
-    fch_filename = f"{prefix}.fch"
-    fchk(mf, fch_filename, density=True)
-
-    # --- Part A: ESP Calculation ---
-    esp_calculator = ESPCalculator(fch_filename)
-    esp_results = esp_calculator.get_ESP_value()
-
-    if gen_dm_flag:
-        esp_calculator.get_acc_grid_data()
-
-    # Save ESP info
-    with open(f"{prefix}_esp_info.json", "w") as f:
-        json.dump(esp_results, fp=f, indent=4)
-
-    esp_max = esp_results.get("ESP_max_eV", 0)
-    esp_min = esp_results.get("ESP_min_eV", 0)
-
-    # --- Part B: Li Deformation Factor Calculation ---
-    li_phi = None
-
-    # Get symbols and coordinates (ensure Angstroms for geometry analysis)
-    symbols = [mol.atom_symbol(i) for i in range(mol.natm)]
-    coords_ang = mol.atom_coords(unit="Ang")
-
-    # Find Li atoms
-    li_indices_0based = [i for i, s in enumerate(symbols) if s == "Li"]
-
-    if li_indices_0based:
-        # Default: Only handle the first Li atom found
-        target_li_idx = li_indices_0based[0]
-        i_1based = target_li_idx + 1
-        li_center = coords_ang[target_li_idx]
-
-        # Initialize ELF Calculator
-        # Using parameters consistent with your main script
-        elf_calculator = ELFDeformationCalculator(
-            fch_filename, isovalue=0.5, diff_list=[0.09], li_cutoff=1.1
-        )
-
-        # Determine ID name for PDB saving (e.g., "pred_1")
-        # Passing a value to li_id triggers PDB saving in your ELFDeformationCalculator
-        save_id = f"{prefix}_{i_1based}"
-
-        try:
-            elf_res = elf_calculator.calculate(
-                atom_index_1based=i_1based,
-                li_center=li_center,
-                li_id=save_id,  # This ensures PDB is saved
-                radius=3.0,
-                grid_spacing=0.1,
-            )
-
-            # Extract phi for the specific diff (0.09)
-            target_diff = 0.09
-            if elf_res and target_diff in elf_res:
-                li_phi = elf_res[target_diff]["phi"]
-        except Exception as e:
-            print(f"Warning: Failed to calculate phi for {prefix} Li: {e}")
-
-    return esp_max, esp_min, li_phi
 
 
 def process_loss_dict(data, item_flag=False, key="pred_vs_label"):
@@ -341,13 +272,23 @@ def process_dm_loss_dict(data, key="pred_vs_label"):
     if "non_diagonal_hamiltonian_mae" in data:
         processed["NonDiag-Ham-MAE (1e-6 Ha)"] = data["non_diagonal_hamiltonian_mae"] * 1e6
 
-    # Orbital Energies (HOMO/LUMO/GAP)
+    # ================= 更改开始: 能量指标输出映射 =================
+    # Orbital Energies (AI DM vs Gaussian Ref)
     if "HOMO" in data:
         processed["HOMO (eV)"] = data["HOMO"]
     if "LUMO" in data:
         processed["LUMO (eV)"] = data["LUMO"]
     if "GAP" in data:
         processed["GAP (eV)"] = data["GAP"]
+
+    # Orbital Energies (Target DM via PySCF vs Gaussian Ref) -> 验证 PySCF 误差
+    if "pyscf_HOMO" in data:
+        processed["PySCF-HOMO-Err (eV)"] = data["pyscf_HOMO"]
+    if "pyscf_LUMO" in data:
+        processed["PySCF-LUMO-Err (eV)"] = data["pyscf_LUMO"]
+    if "pyscf_GAP" in data:
+        processed["PySCF-GAP-Err (eV)"] = data["pyscf_GAP"]
+    # ================= 更改结束 =================
 
     # Orbital Similarities
     if "HOMO_coefficients" in data:
@@ -385,7 +326,6 @@ def process_dm_loss_dict(data, key="pred_vs_label"):
         pass
 
     return processed
-
 
 
 def get_electron_number_from_dm(dm, overlap):
@@ -593,29 +533,37 @@ def find_best_dm_transform_permutation(
 
 
 def get_electronic_properties(
-        mol, ham=None, overlap=None, dm=None, shifted_ham=None, pcm_eps=None
+        mol, ham=None, overlap=None, dm=None, shifted_ham=None, pcm_eps=None, mf=None
 ):
     """
     Helper function to extract electronic properties (Energies, Orbitals, Gap)
     from either Hamiltonian+Overlap OR Density Matrix.
 
     Updated to support PCM solvent model via pcm_eps.
+    Now supports passing a pre-initialized PySCF mean-field object (`mf`).
     """
     # 1. 准备 Hamiltonian 和 Overlap
     if ham is None:
         if dm is None:
             raise ValueError("Must provide either Hamiltonian or Density Matrix")
 
-        mf = dft.RKS(mol)
-        mf.xc = "b3lyp"
+        # 如果没有传入初始化的 mf，则在这里创建
+        if mf is None:
+            mf = dft.RKS(mol)
+            mf.xc = "b3lyp"
 
-        # --- Add PCM (Solvent) Model if requested ---
-        if pcm_eps is not None and pcm_eps > 1.0:
-            mf = mf.ddCOSMO()
-            mf.with_solvent.eps = pcm_eps
+            # --- Add PCM (Solvent) Model if requested ---
+            if pcm_eps is not None and pcm_eps > 1.0:
+                mf = mf.PCM()
+                mf.with_solvent.eps = pcm_eps
+                mf.with_solvent.method = 'IEF-PCM'
+                uff_radii = build_uff_radii_table()  # Bohr, 未缩放
+                mf.with_solvent.radii_table = 1.1 * uff_radii  # Alpha=1.1, 已含缩放
+                mf.with_solvent.lebedev_order = 31
 
         # PySCF get_fock returns (N, N) for RKS usually, but let's handle potential (1, N, N)
         # With PCM enabled, get_fock includes: H_core + J + K + V_pcm
+        # 使用传入的或者新建的 mf 计算 Fock
         ham = mf.get_fock(dm=dm)
 
         if overlap is None:
@@ -666,6 +614,10 @@ def get_electronic_properties(
         "shifted_ham": shifted_ham_2d,  # (N, N)
         "density_matrix": dm if dm is not None else make_rdm1(mo_coeff=coeffs, mo_occ=mo_occ),
         "mo_occ": mo_occ,
+        # ================= 更改开始 =================
+        "mo_energy": energies,  # 完整轨道能量，供下游复用
+        "mo_coeff": coeffs,     # 完整轨道系数，供下游复用
+        # ================= 更改结束 =================
         "orbital_coefficients": coeffs[:, : homo_idx + 1],
         "HOMO_coefficients": coeffs[:, homo_idx],
         "LUMO_coefficients": coeffs[:, homo_idx + 1],
@@ -673,37 +625,171 @@ def get_electronic_properties(
     }
     return results
 
+def calculate_properties_from_dm(
+    mol,
+    dm,
+    prefix,
+    gen_dm_flag: bool = False,
+    # --- 新增: 允许复用上游已经算好的 pyscf 对象 / 矩阵 ---
+    mf=None,
+    fock=None,
+    overlap=None,
+    mo_energy=None,
+    mo_coeff=None,
+    mo_occ=None,
+    xc: str = "b3lyp",
+    pcm_eps: float = None,
+):
+    """
+    从 density matrix 生成 fchk，并用 Multiwfn 计算:
+      - ESP max/min
+      - Li 的 deformation factor (phi)
+
+    优化:
+    - 若上游(get_ham_flag=True)已算过 fock/overlap 或已有 mf，则可传入 mf/fock/overlap
+      以跳过重复 mf 初始化与 mf.get_fock(dm=dm) 的耗时步骤。
+    - 若还额外提供 mo_energy/mo_coeff，则连 eig 也可跳过。
+
+    返回:
+      (ESP_max_eV, ESP_min_eV, li_phi_or_None)
+    """
+    import json
+    import numpy as np
+    from mokit.lib.py2fch_direct import fchk
+    from pyscf import dft
+    from emoles.multiwfn import ESPCalculator, ELFDeformationCalculator
+
+    # ========== 0) 准备 mf ==========
+    if mf is None:
+        mf = dft.RKS(mol)
+        mf.xc = xc
+
+        # 可选: 与 get_electronic_properties 保持一致的 PCM（仅当你需要）
+        if pcm_eps is not None and pcm_eps > 1.0:
+            mf = mf.PCM()
+            mf.with_solvent.eps = pcm_eps
+            mf.with_solvent.method = "IEF-PCM"
+            uff_radii = build_uff_radii_table()
+            mf.with_solvent.radii_table = 1.1 * uff_radii
+            mf.with_solvent.lebedev_order = 31
+
+    # ========== 1) overlap / fock / (mo_energy, mo_coeff) ==========
+    if overlap is None:
+        # mf.get_ovlp() 通常更稳（如带溶剂模型时），没有就用 intor
+        try:
+            overlap = mf.get_ovlp()
+        except Exception:
+            overlap = mol.intor("int1e_ovlp")
+
+    # 规范化维度为 2D
+    ov_2d = overlap[0] if (hasattr(overlap, "ndim") and overlap.ndim == 3) else overlap
+
+    if (mo_energy is None) or (mo_coeff is None):
+        # 没有 mo 信息时，至少需要 fock
+        if fock is None:
+            # 只有在没有上游复用数据时，才会做 get_fock（耗时）
+            fock = mf.get_fock(dm=dm)
+
+        fock_2d = fock[0] if (hasattr(fock, "ndim") and fock.ndim == 3) else fock
+
+        # 用 pyscf 的 eig 得到 mo_energy/mo_coeff（相对 get_fock 便宜很多）
+        mo_energy, mo_coeff = mf.eig(fock_2d, ov_2d)
+
+    # 若未提供 mo_occ，则按闭壳层占据生成（与 get_electronic_properties 逻辑一致）
+    if mo_occ is None:
+        n_electrons = mol.tot_electrons()
+        homo_idx = int(n_electrons / 2) - 1
+        mo_occ = get_mo_occ(full_len=len(mo_energy), occ_len=homo_idx + 1)
+
+    # 写 fchk 需要这些字段
+    mf.mo_energy = np.array(mo_energy)
+    mf.mo_coeff = np.array(mo_coeff)
+    mf.mo_occ = np.array(mo_occ)
+    mf.dm = dm  # 保持你原先用法：mokit 侧可能会读取 mf.dm
+
+    # ========== 2) 生成 fchk ==========
+    fch_filename = f"{prefix}.fch"
+    fchk(mf, fch_filename, density=True)
+
+    # ========== 3) ESP ==========
+    esp_calculator = ESPCalculator(fch_filename)
+    esp_results = esp_calculator.get_ESP_value()
+    if gen_dm_flag:
+        esp_calculator.get_acc_grid_data()
+
+    with open(f"{prefix}_esp_info.json", "w") as f:
+        json.dump(esp_results, fp=f, indent=4)
+
+    esp_max = esp_results.get("ESP_max_eV", 0.0)
+    esp_min = esp_results.get("ESP_min_eV", 0.0)
+
+    # ========== 4) Li deformation factor (phi) ==========
+    li_phi = None
+    symbols = [mol.atom_symbol(i) for i in range(mol.natm)]
+    coords_ang = mol.atom_coords(unit="Ang")
+    li_indices_0based = [i for i, s in enumerate(symbols) if s == "Li"]
+
+    if li_indices_0based:
+        target_li_idx = li_indices_0based[0]
+        i_1based = target_li_idx + 1
+        li_center = coords_ang[target_li_idx]
+
+        elf_calculator = ELFDeformationCalculator(
+            fch_filename, isovalue=0.5, diff_list=[0.09], li_cutoff=1.1
+        )
+        save_id = f"{prefix}_{i_1based}"
+
+        try:
+            elf_res = elf_calculator.calculate(
+                atom_index_1based=i_1based,
+                li_center=li_center,
+                li_id=save_id,
+                radius=3.0,
+                grid_spacing=0.1,
+            )
+            target_diff = 0.09
+            if elf_res and target_diff in elf_res:
+                li_phi = elf_res[target_diff]["phi"]
+        except Exception as e:
+            print(f"Warning: Failed to calculate phi for {prefix} Li: {e}")
+
+    return esp_max, esp_min, li_phi
+
 
 def evaluate_dm_from_npy(
-        abs_ase_path,
-        npy_folder_path,
-        convention="def2svp",
-        mol_charge=0,
-        pred_dm_filename="predicted_dm.npy",
-        target_dm_filename="target_dm.npy",
-        transform_dm_flag=True,
-        get_esp_sta_flag=True,
-        get_ham_flag=True,
-        keep_xyz_file=True,
-        n_save_cube_items: int = 5,
-        temp_data_file: str = "temp_cube_data.pkl",
-        max_items: int = 300,
-        gen_esp_cube_flag: bool = False,
-        summary_filename="evaluation_summary.npz",
-        pcm_eps: float = 25,  # Default solvent epsilon
+    abs_ase_path,
+    npy_folder_path,
+    convention="def2svp",
+    mol_charge=0,
+    pred_dm_filename="predicted_dm.npy",
+    target_dm_filename="target_dm.npy",
+    transform_dm_flag=True,
+    get_esp_sta_flag=True,
+    get_ham_flag=True,
+    keep_xyz_file=True,
+    n_save_cube_items: int = 5,
+    temp_data_file: str = "temp_cube_data.pkl",
+    max_items: int = 300,
+    gen_esp_cube_flag: bool = False,
+    summary_filename="evaluation_summary.npz",
+    pcm_eps: float = 25,
+    verbose_profiling: bool = False,
 ):
     import time
     import json
     import numpy as np
     import traceback
     import pickle
+    import os
     from ase.db import connect
     from ase.io import write
     from tqdm import tqdm
     import pyscf
+    from ase.units import Hartree
 
-    def format_number_local(x):
-        return "{:.6f}".format(x)
+    def _log_time(msg):
+        if verbose_profiling:
+            print(msg)
 
     if convention == "6311gdp":
         basis = "6-311+g(d,p)"
@@ -734,6 +820,10 @@ def evaluate_dm_from_npy(
                 break
             attempted_count += 1
             cwd_ = os.getcwd()
+
+            t_item_start = time.time()
+            _log_time(f"\n[{idx}] --- Timing Profiling Started ---")
+
             try:
                 work_dir = os.path.join(npy_folder_path, f"{idx}")
                 if not os.path.exists(work_dir):
@@ -750,8 +840,10 @@ def evaluate_dm_from_npy(
                     pred_dm = matrix_transform(pred_dm, atom_nums, convention=back_convention)
                     target_dm = matrix_transform(target_dm, atom_nums, convention=back_convention)
 
-                current_mol_charge = a_row.data.get("charge", mol_charge)
+                t_load = time.time()
+                _log_time(f"[{idx}] [Time] NPY Load & Matrix Transform: {t_load - t_item_start:.4f} s")
 
+                current_mol_charge = a_row.data.get("charge", mol_charge)
                 sum_of_atomic_numbers = an_atoms.get_atomic_numbers().sum()
                 total_electrons = sum_of_atomic_numbers - current_mol_charge
                 mol_spin = total_electrons % 2
@@ -766,11 +858,14 @@ def evaluate_dm_from_npy(
                 mol.build(verbose=0, atom=t, basis=basis, unit="ang")
                 overlap = mol.intor("int1e_ovlp")
 
+                t_mol = time.time()
+                _log_time(f"[{idx}] [Time] PySCF Mole Build & Overlap: {t_mol - t_load:.4f} s")
+
                 expected_electrons = float(total_electrons)
                 Ne_pred = get_electron_number_from_dm(pred_dm, overlap)
                 Ne_target = get_electron_number_from_dm(target_dm, overlap)
 
-                # 1. 基础误差
+                # 1) 基础误差
                 errors = calculate_dm_dipole_mae(pred_dm, target_dm, mol)
 
                 _, atom_in_mo_indices = generate_molecule_transform_indices(
@@ -789,24 +884,96 @@ def evaluate_dm_from_npy(
                 errors["target_electron_number_error"] = abs(Ne_target - expected_electrons)
                 errors["electron_number_pred_vs_target_error"] = abs(Ne_pred - Ne_target)
 
-                # 2. 计算 DM 推导出的 Hamiltonian 误差及轨道 (含 PCM 支持)
+                t_basic_err = time.time()
+                _log_time(f"[{idx}] [Time] Basic DM & Dipole Metrics:  {t_basic_err - t_mol:.4f} s")
+
+                # 用于写入每个任务 json 的“数值本身”（非 error）
+                electronic_properties_eV = None
+
+                # 2) DM 推导的电子性质 / Ham / 轨道等
+                mf_shared = None
+                pred_props = None
+                target_props = None
+
                 if get_ham_flag:
-                    # print(pcm_eps)
-                    pcm_eps = a_row.data.get("dielectric_constant", pcm_eps)
-                    # print(pcm_eps)
-                    # 将 pcm_eps 传入，使 get_fock 包含溶剂势
+                    current_pcm_eps = a_row.data.get("dielectric_constant", pcm_eps)
+
+                    # 共享 mf：pred/target 复用
+                    mf_shared = pyscf.dft.RKS(mol)
+                    mf_shared.xc = "b3lyp"
+
+                    if current_pcm_eps is not None and current_pcm_eps > 1.0:
+                        mf_shared = mf_shared.PCM()
+                        mf_shared.with_solvent.eps = current_pcm_eps
+                        mf_shared.with_solvent.method = 'IEF-PCM'
+                        uff_radii_tb = build_uff_radii_table()
+                        mf_shared.with_solvent.radii_table = 1.1 * uff_radii_tb
+                        mf_shared.with_solvent.lebedev_order = 31
+
+                    t_mf = time.time()
+                    _log_time(f"[{idx}] [Time] Init shared Mean-Field:     {t_mf - t_basic_err:.4f} s")
+
                     pred_props = get_electronic_properties(
-                        mol, dm=pred_dm, overlap=overlap, pcm_eps=pcm_eps
+                        mol, dm=pred_dm, overlap=overlap, pcm_eps=current_pcm_eps, mf=mf_shared
                     )
+                    t_prop_pred = time.time()
+                    _log_time(f"[{idx}] [Time] Get Props (Pred get_fock):  {t_prop_pred - t_mf:.4f} s")
+
                     target_props = get_electronic_properties(
-                        mol, dm=target_dm, overlap=overlap, pcm_eps=pcm_eps
+                        mol, dm=target_dm, overlap=overlap, pcm_eps=current_pcm_eps, mf=mf_shared
                     )
+                    t_prop_tgt = time.time()
+                    _log_time(f"[{idx}] [Time] Get Props (Target get_fock):{t_prop_tgt - t_prop_pred:.4f} s")
+
+                    # Gaussian label (eV)
+                    gaussian_homo = a_row.data.get("HOMO_eV", 0.0)
+                    gaussian_lumo = a_row.data.get("LUMO_eV", 0.0)
+                    gaussian_gap = a_row.data.get("GAP_eV", gaussian_lumo - gaussian_homo)
+
+                    # ======= (需求2) 存“数值本身”，不是 error =======
+                    pred_homo_ev = float(pred_props["HOMO"]) * Hartree
+                    pred_lumo_ev = float(pred_props["LUMO"]) * Hartree
+                    pred_gap_ev = float(pred_props["GAP"]) * Hartree
+
+                    pyscf_homo_ev = float(target_props["HOMO"]) * Hartree
+                    pyscf_lumo_ev = float(target_props["LUMO"]) * Hartree
+                    pyscf_gap_ev = float(target_props["GAP"]) * Hartree
+
+                    electronic_properties_eV = {
+                        "pred": {
+                            "HOMO_eV": pred_homo_ev,
+                            "LUMO_eV": pred_lumo_ev,
+                            "GAP_eV": pred_gap_ev,
+                        },
+                        # 这里的 pyscf 指“用 label/target DM 走 PySCF 得到的能级”
+                        "pyscf": {
+                            "HOMO_eV": pyscf_homo_ev,
+                            "LUMO_eV": pyscf_lumo_ev,
+                            "GAP_eV": pyscf_gap_ev,
+                        },
+                        "gaussian": {
+                            "HOMO_eV": float(gaussian_homo),
+                            "LUMO_eV": float(gaussian_lumo),
+                            "GAP_eV": float(gaussian_gap),
+                        },
+                    }
+
+                    # a) error: pred vs gaussian
+                    errors["HOMO"] = abs(pred_homo_ev - gaussian_homo)
+                    errors["LUMO"] = abs(pred_lumo_ev - gaussian_lumo)
+                    errors["GAP"] = abs(pred_gap_ev - gaussian_gap)
+
+                    # b) error: pyscf(target_dm) vs gaussian
+                    errors["pyscf_HOMO"] = abs(pyscf_homo_ev - gaussian_homo)
+                    errors["pyscf_LUMO"] = abs(pyscf_lumo_ev - gaussian_lumo)
+                    errors["pyscf_GAP"] = abs(pyscf_gap_ev - gaussian_gap)
 
                     eval_keys = [
-                        "hamiltonian", "HOMO", "LUMO", "GAP",
-                        "orbital_coefficients", "HOMO_coefficients", "LUMO_coefficients",
+                        "hamiltonian",
+                        "orbital_coefficients",
+                        "HOMO_coefficients",
+                        "LUMO_coefficients",
                     ]
-
                     ham_orb_errors = criterion(
                         pred_props,
                         target_props,
@@ -816,6 +983,9 @@ def evaluate_dm_from_npy(
                         mol=mol,
                     )
                     errors.update(ham_orb_errors)
+
+                    t_crit = time.time()
+                    _log_time(f"[{idx}] [Time] Criterion Matrix Ops:       {t_crit - t_prop_tgt:.4f} s")
 
                     if idx < n_save_cube_items:
                         mol_info = {
@@ -834,17 +1004,48 @@ def evaluate_dm_from_npy(
                             "tgt_info": target_props,
                         }
                         temp_cube_data.append(cube_item)
+                else:
+                    t_crit = time.time()
 
-                print(errors)
-
-                # 3. 计算 ESP (通常 ESP 仍基于真空气相或特定后处理，此处保留原逻辑)
+                # 3) ESP / deformation
                 if get_esp_sta_flag:
-                    p_esp_max, p_esp_min, p_phi = calculate_properties_from_dm(
-                        mol, pred_dm, "pred", gen_dm_flag=gen_esp_cube_flag
-                    )
-                    t_esp_max, t_esp_min, t_phi = calculate_properties_from_dm(
-                        mol, target_dm, "target", gen_dm_flag=gen_esp_cube_flag
-                    )
+                    # ======= (需求1) 若 get_ham_flag 已算过 fock，则复用，避免重复 get_fock =======
+                    if get_ham_flag and (pred_props is not None) and (target_props is not None):
+                        # ================= 更改开始: 传入 mo_energy, mo_coeff 直接复用 =================
+                        p_esp_max, p_esp_min, p_phi = calculate_properties_from_dm(
+                            mol,
+                            pred_dm,
+                            "pred",
+                            gen_dm_flag=gen_esp_cube_flag,
+                            mf=mf_shared,
+                            fock=pred_props.get("hamiltonian", None),
+                            overlap=pred_props.get("overlap", overlap),
+                            mo_energy=pred_props.get("mo_energy", None),
+                            mo_coeff=pred_props.get("mo_coeff", None),
+                            mo_occ=pred_props.get("mo_occ", None),
+                        )
+                        t_esp_max, t_esp_min, t_phi = calculate_properties_from_dm(
+                            mol,
+                            target_dm,
+                            "target",
+                            gen_dm_flag=gen_esp_cube_flag,
+                            mf=mf_shared,
+                            fock=target_props.get("hamiltonian", None),
+                            overlap=target_props.get("overlap", overlap),
+                            mo_energy=target_props.get("mo_energy", None),
+                            mo_coeff=target_props.get("mo_coeff", None),
+                            mo_occ=target_props.get("mo_occ", None),
+                        )
+                        # ================= 更改结束 =================
+                    else:
+                        # fallback: 维持旧逻辑（内部会 init mf + get_fock）
+                        p_esp_max, p_esp_min, p_phi = calculate_properties_from_dm(
+                            mol, pred_dm, "pred", gen_dm_flag=gen_esp_cube_flag
+                        )
+                        t_esp_max, t_esp_min, t_phi = calculate_properties_from_dm(
+                            mol, target_dm, "target", gen_dm_flag=gen_esp_cube_flag
+                        )
+
                     errors["esp_max_mae"] = abs(t_esp_max - p_esp_max)
                     errors["esp_min_mae"] = abs(t_esp_min - p_esp_min)
                     if p_phi is not None and t_phi is not None:
@@ -852,30 +1053,47 @@ def evaluate_dm_from_npy(
                     else:
                         errors["deformation_factor_mae"] = None
 
+                t_esp = time.time()
+                if get_esp_sta_flag:
+                    _log_time(f"[{idx}] [Time] ESP & Deformation Calc:     {t_esp - t_crit:.4f} s")
+
                 if keep_xyz_file:
                     write("atomic_structure.xyz", an_atoms)
 
+                # 累加全局平均（只累加 errors，不包括电子性质的 raw values）
                 for key, val in errors.items():
                     if val is not None:
                         total_error_dict["pred_vs_label"][key] = (
-                                total_error_dict["pred_vs_label"].get(key, 0.0) + val
+                            total_error_dict["pred_vs_label"].get(key, 0.0) + val
                         )
-
                 total_error_dict["total_items"] += 1
 
-                # Save Logs
+                # Save per-task JSON (加入 raw 值)
                 mol_info_log = {
                     "formula": an_atoms.get_chemical_formula(),
                     "charge": int(current_mol_charge),
                     "spin": int(mol_spin),
                 }
-                local_result = {"idx": idx, "mol_info": mol_info_log, "errors": errors}
+                local_result = {
+                    "idx": idx,
+                    "mol_info": mol_info_log,
+                    "errors": errors,
+                }
+                # (需求2) 写入 raw 电子性质值（非 error）
+                if electronic_properties_eV is not None:
+                    local_result["electronic_properties_eV"] = electronic_properties_eV
+
                 with open("dm_evaluation_result.json", "w") as f_json:
                     json.dump(local_result, f_json, indent=4, default=str)
 
+                # summary npz 仍以 errors 为主；如果你也想把 raw 值写进 npz，可自行在这里 flat_data.update(...)
                 flat_data = {"idx": idx}
                 flat_data.update(errors)
                 summary_data_list.append(flat_data)
+
+                t_save = time.time()
+                _log_time(f"[{idx}] [Time] Logging & File Saving:      {t_save - t_esp:.4f} s")
+                _log_time(f"[{idx}] [Time] >>> TOTAL For Item {idx} <<< : {t_save - t_item_start:.4f} s\n")
 
             except Exception as e:
                 fail_count += 1
@@ -895,7 +1113,7 @@ def evaluate_dm_from_npy(
 
     n = total_error_dict["total_items"]
     if n > 0:
-        for key in total_error_dict["pred_vs_label"].keys():
+        for key in list(total_error_dict["pred_vs_label"].keys()):
             total_error_dict["pred_vs_label"][key] /= n
 
     end_time = time.time()

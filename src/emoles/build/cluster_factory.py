@@ -5,10 +5,6 @@ import random
 import itertools
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Union, Generator
-
-# ==========================================
-# New Import for Parallelism
-# ==========================================
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -17,14 +13,8 @@ from ase.db import connect
 from ase.io import write
 from tqdm import tqdm
 
-# ==========================================
-# Imports & Dependency Handling
-# ==========================================
-
-# 1. Core Logic Import
 from emoles.build.cluster import build_cluster
 
-# 2. UMA Import (Optional/Safe)
 try:
     import emoles.build.uma_entry as uma_entry
 
@@ -33,23 +23,14 @@ except ImportError:
     UMA_AVAILABLE = False
     uma_entry = None
 
-# 3. RDKit for Fallback (Required by emoles anyway)
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
-# ==========================================
-# Default Constants
-# ==========================================
 DEFAULT_DME_SMILES = "COCCOC:DME"
 DEFAULT_FSI_SMILES = "F[S](=O)(=O)[N-][S](=O)(=O)F:FSI"
 
 
-# ==========================================
-# Helper Functions
-# ==========================================
-
 def sanitize_filename(filename: str, max_length: int = 30) -> str:
-    """Shorten names for complex filenames."""
     sanitized = re.sub(r'[^\w\-.]', '', filename)
     if len(sanitized) > max_length:
         return sanitized[:max_length]
@@ -57,24 +38,16 @@ def sanitize_filename(filename: str, max_length: int = 30) -> str:
 
 
 def _fallback_smiles_to_atoms(smiles: str) -> Atoms:
-    """
-    Lightweight fallback to convert SMILES to ASE Atoms without UMA.
-    Used when --no-uma is set or UMA is missing.
-    """
     mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        raise ValueError(f"Invalid SMILES: {smiles}")
+    if mol is None: raise ValueError(f"Invalid SMILES: {smiles}")
     mol = Chem.AddHs(mol)
-    # Basic embedding
     res = AllChem.EmbedMolecule(mol, AllChem.ETKDG())
-    if res == -1:
-        AllChem.EmbedMolecule(mol, AllChem.ETKDG(useRandomCoords=True))
+    if res == -1: AllChem.EmbedMolecule(mol, AllChem.ETKDG(useRandomCoords=True))
     try:
         AllChem.UFFOptimizeMolecule(mol)
     except:
         pass
 
-    # Convert to ASE
     conf = mol.GetConformer()
     positions = []
     symbols = []
@@ -82,79 +55,40 @@ def _fallback_smiles_to_atoms(smiles: str) -> Atoms:
         pos = conf.GetAtomPosition(atom.GetIdx())
         positions.append([pos.x, pos.y, pos.z])
         symbols.append(atom.GetSymbol())
-
     return Atoms(symbols=symbols, positions=positions)
 
 
 def load_db_entries(db_path: str, show_progress: bool = True) -> List[Dict]:
-    """Load entries from an ASE database file."""
     entries = []
-    if db_path is None or not os.path.exists(db_path):
-        return entries
-
+    if not db_path or not os.path.exists(db_path): return entries
     with connect(db_path) as db:
         total_rows = db.count()
         rows = db.select()
         if show_progress and total_rows > 0:
             rows = tqdm(rows, total=total_rows, desc=f"Loading {os.path.basename(db_path)}", unit="entry")
-
         for row in rows:
             name = row.get('name', f"row_{row.id}")
-            entries.append({
-                'id': row.id,
-                'name': name,
-                'atoms': row.toatoms(),
-            })
+            entries.append({'id': row.id, 'name': name, 'atoms': row.toatoms()})
     return entries
 
 
-def optimize_monomers(
-        entries: List[Dict],
-        prefix: str,
-        root_workspace: str,
-        device: str,
-        use_uma: bool
-) -> List[Dict]:
-    """
-    Prepare monomers.
-    If use_uma is True and Available -> Run UMA optimization.
-    Else -> Convert SMILES to Atoms using lightweight RDKit fallback.
-    """
-
-    # --- Branch 1: NO UMA (Fast Path / Fallback) ---
+def optimize_monomers(entries: List[Dict], prefix: str, root_workspace: str, device: str, use_uma: bool) -> List[Dict]:
     if not use_uma or not UMA_AVAILABLE:
-        if use_uma and not UMA_AVAILABLE:
-            print(f"[Warning] UMA requested but not installed. Falling back to basic RDKit embedding for {prefix}.")
-        else:
-            print(f"[Info] UMA skipped for {prefix}. Using basic RDKit embedding.")
-
         processed_entries = []
         for ent in entries:
             atoms_obj = ent['atoms']
-            # If input is string, convert it
             if isinstance(atoms_obj, str):
                 try:
                     atoms_obj = _fallback_smiles_to_atoms(atoms_obj)
-                except Exception as e:
-                    print(f"  Error converting {ent['name']}: {e}")
+                except:
                     continue
-
-            # Tag info
             atoms_obj.info['n_anion'] = 1 if prefix.lower() == "anion" else 0
-
-            processed_entries.append({
-                'id': ent['id'],
-                'name': ent['name'],
-                'atoms': atoms_obj
-            })
+            processed_entries.append({'id': ent['id'], 'name': ent['name'], 'atoms': atoms_obj})
         return processed_entries
 
-    # --- Branch 2: USE UMA (Optimization Path) ---
-    print(f"\n[Pre-Optimization] detected SMILES input for {prefix}. Optimizing monomers with UMA...")
     temp_workspace = os.path.join(root_workspace, f"temp_opt_{prefix.lower()}")
     os.makedirs(temp_workspace, exist_ok=True)
     input_db_path = os.path.join(temp_workspace, "raw_monomers.db")
-
     if os.path.exists(input_db_path): os.remove(input_db_path)
 
     with connect(input_db_path) as db:
@@ -162,34 +96,19 @@ def optimize_monomers(
             atoms_obj = ent['atoms']
             if isinstance(atoms_obj, str):
                 try:
-                    # Use UMA's internal converter if available, or fallback
                     if hasattr(uma_entry, 'smiles_to_atoms'):
                         atoms_obj = uma_entry.smiles_to_atoms(atoms_obj)
                     else:
                         atoms_obj = _fallback_smiles_to_atoms(atoms_obj)
-                except Exception as e:
-                    print(f"  Error embedding {ent['name']}: {e}")
+                except:
                     continue
-
             atoms_obj.info['n_anion'] = 1 if prefix.lower() == "anion" else 0
             db.write(atoms_obj, name=ent['name'])
 
-    optimized_db_path = uma_entry.entry(
-        input_db=input_db_path,
-        workspace=temp_workspace,
-        device=device,
-        verbose=False,
-        show_progress=True
-    )
-
-    if optimized_db_path is None:
-        optimized_db_path = os.path.join(temp_workspace, "optimized_all.db")
-
-    if not os.path.exists(optimized_db_path):
-        print(f"[Warning] Optimized DB not found for {prefix}. Using input structures.")
-        # Re-read raw if opt failed
+    optimized_db_path = uma_entry.entry(input_db=input_db_path, workspace=temp_workspace, device=device, verbose=False,
+                                        show_progress=True)
+    if not optimized_db_path or not os.path.exists(optimized_db_path):
         return load_db_entries(input_db_path, show_progress=False)
-
     return load_db_entries(optimized_db_path, show_progress=False)
 
 
@@ -208,29 +127,17 @@ def parse_smiles_input(smiles_list: List[str], default_prefix: str) -> List[Dict
 def normalize_input_data(source, prefix, show_progress, workspace, device, use_uma) -> List[Dict]:
     if source is None: return []
     if isinstance(source, list) and len(source) > 0 and isinstance(source[0], dict): return source
-
     if isinstance(source, str) and (source.endswith('.db') or source.endswith('.json')):
-        print(f"Loading {prefix} from DB: {source}")
         return load_db_entries(source, show_progress)
-
     s_list = [source] if isinstance(source, str) else source
     raw_entries = parse_smiles_input(s_list, prefix)
-
-    # Pass the UMA flag down
     return optimize_monomers(raw_entries, prefix, workspace, device, use_uma)
 
 
-# ==========================================
-# Combinatorial Logic
-# ==========================================
-
 def integer_partitions(target: int, k: int, min_val: int = 1) -> Generator[Tuple[int, ...], None, None]:
-    """Generate all ways to sum to 'target' using 'k' integers, each >= min_val."""
     if k == 1:
-        if target >= min_val:
-            yield (target,)
+        if target >= min_val: yield (target,)
         return
-
     upper_bound = target - (k - 1) * min_val
     for i in range(min_val, upper_bound + 1):
         for tail in integer_partitions(target - i, k - 1, min_val):
@@ -240,137 +147,122 @@ def integer_partitions(target: int, k: int, min_val: int = 1) -> Generator[Tuple
 def plan_mixtures(
         solvents_pool: List[Dict],
         anions_pool: List[Dict],
-        mix_n: int,
+        solv_mix_n_list: Tuple[int, ...],
+        anion_mix_n_list: Tuple[int, ...],
         num_mixtures: int,
-        target_totals: Tuple[int, ...],
-        anion_counts: Tuple[int, ...],
+        states: List[Tuple[int, int]],  # [(n_solvent, n_anion)]
+        repeats: int = 1,
         seed: int = 42
 ) -> List[Dict]:
-    """Generates a build plan for a SPECIFIC mix_n."""
     plan = []
     random.seed(seed)
+    unique_signatures = set()
 
-    if mix_n > len(solvents_pool):
-        return []
+    for s_mix_n in solv_mix_n_list:
+        if s_mix_n > len(solvents_pool): continue
+        import math
+        n_total_combos = math.comb(len(solvents_pool), s_mix_n)
+        solvent_combinations = []
+        if s_mix_n == 1:
+            solvent_combinations = [(s,) for s in solvents_pool]
+        elif n_total_combos <= num_mixtures * 2:
+            solvent_combinations = list(itertools.combinations(solvents_pool, s_mix_n))
+        else:
+            seen = set()
+            attempts = 0
+            while len(solvent_combinations) < num_mixtures and attempts < num_mixtures * 10:
+                combo = tuple(sorted(random.sample(solvents_pool, s_mix_n), key=lambda x: x['name']))
+                if combo not in seen:
+                    seen.add(combo)
+                    solvent_combinations.append(combo)
+                attempts += 1
 
-    import math
-    n_total_combos = math.comb(len(solvents_pool), mix_n)
+        for a_mix_n in anion_mix_n_list:
+            anion_combinations = []
+            if anions_pool and a_mix_n <= len(anions_pool):
+                anion_combinations = list(itertools.combinations(anions_pool, a_mix_n))
 
-    solvent_combinations = []
-    if mix_n == 1:
-        solvent_combinations = [(s,) for s in solvents_pool]
-    elif n_total_combos <= num_mixtures * 2:
-        solvent_combinations = list(itertools.combinations(solvents_pool, mix_n))
-    else:
-        seen = set()
-        attempts = 0
-        while len(solvent_combinations) < num_mixtures and attempts < num_mixtures * 10:
-            combo = tuple(sorted(random.sample(solvents_pool, mix_n), key=lambda x: x['name']))
-            if combo not in seen:
-                seen.add(combo)
-                solvent_combinations.append(combo)
-            attempts += 1
+            for solvents_tuple in solvent_combinations:
+                for n_solvent, n_anion in states:
+                    total_coord = n_solvent + n_anion
+                    if total_coord == 0: continue
 
-    for solvents_tuple in solvent_combinations:
-        current_anions_loop = anions_pool if anions_pool else [None]
+                    if n_solvent > 0 and n_solvent < s_mix_n: continue
+                    if n_anion > 0 and n_anion < a_mix_n: continue
 
-        for anion_entry in current_anions_loop:
-            for total_coord in target_totals:
-                valid_anion_counts = [ac for ac in anion_counts if ac <= total_coord]
-                if not anion_entry: valid_anion_counts = [0]
+                    solv_parts = list(integer_partitions(n_solvent, s_mix_n, 1)) if n_solvent > 0 else [()]
 
-                for n_anion in valid_anion_counts:
-                    n_solvent_total = total_coord - n_anion
+                    if n_anion == 0:
+                        anion_parts_list = [(None, ())]
+                    else:
+                        if not anion_combinations: continue
+                        anion_parts_list = []
+                        for a_tup in anion_combinations:
+                            for ap in integer_partitions(n_anion, a_mix_n, 1):
+                                anion_parts_list.append((a_tup, ap))
 
-                    if n_solvent_total < mix_n:
-                        continue
+                    for sp in solv_parts:
+                        for a_tup, ap in anion_parts_list:
+                            ligands_def = []
+                            if n_solvent > 0:
+                                for idx, s_ent in enumerate(solvents_tuple):
+                                    ligands_def.append({'type': 'solvent', 'entry': s_ent, 'count': sp[idx]})
+                            if n_anion > 0 and a_tup is not None:
+                                for idx, a_ent in enumerate(a_tup):
+                                    ligands_def.append({'type': 'anion', 'entry': a_ent, 'count': ap[idx]})
 
-                    partitions = list(integer_partitions(n_solvent_total, mix_n, min_val=1))
+                            sig_parts = sorted(
+                                [f"{lig['type']}:{lig['entry']['name']}:{lig['count']}" for lig in ligands_def])
+                            signature = "|".join(sig_parts)
 
-                    for p in partitions:
-                        ligands_def = []
-                        for idx, s_ent in enumerate(solvents_tuple):
-                            ligands_def.append({
-                                'type': 'solvent',
-                                'entry': s_ent,
-                                'count': p[idx]
-                            })
+                            if signature not in unique_signatures:
+                                unique_signatures.add(signature)
+                                charge = 1 - n_anion
+                                cat = "SSIP" if n_anion == 0 else ("CIP" if n_anion == 1 else "AGG")
 
-                        if anion_entry and n_anion > 0:
-                            ligands_def.append({
-                                'type': 'anion',
-                                'entry': anion_entry,
-                                'count': n_anion
-                            })
-
-                        charge = 1 - n_anion
-                        if n_anion == 0:
-                            cat = "SSIP"
-                        elif n_anion == 1:
-                            cat = "CIP"
-                        else:
-                            cat = "AGG"
-
-                        plan.append({
-                            'category': cat,
-                            'ligands': ligands_def,
-                            'total_coord': total_coord,
-                            'n_anion_total': n_anion,
-                            'charge': charge,
-                            'mix_type': f"Mix-{mix_n}"
-                        })
+                                for rep in range(repeats):
+                                    plan.append({
+                                        'category': cat,
+                                        'n_solvent_total': n_solvent,
+                                        'n_anion_total': n_anion,
+                                        'ligands': ligands_def,
+                                        'total_coord': total_coord,
+                                        'charge': charge,
+                                        'mix_type': f"S{s_mix_n}-A{a_mix_n}",
+                                        'repeat_idx': rep
+                                    })
     return plan
 
 
 def compose_filename(ion: str, plan_item: Dict) -> str:
     parts = [ion, plan_item['category']]
-
-    solv_idx = 1
+    solv_idx, anion_idx = 1, 1
     for lig in plan_item['ligands']:
+        name = sanitize_filename(lig['entry']['name'])
         if lig['type'] == 'solvent':
-            name = sanitize_filename(lig['entry']['name'])
-            parts.append(f"S{solv_idx}-{name}_n{solv_idx}-{lig['count']}")
+            parts.append(f"S{solv_idx}-{name}_n{lig['count']}")
             solv_idx += 1
-
-    for lig in plan_item['ligands']:
-        if lig['type'] == 'anion':
-            name = sanitize_filename(lig['entry']['name'])
-            parts.append(f"A-{name}_na-{lig['count']}")
-
+        elif lig['type'] == 'anion':
+            parts.append(f"A{anion_idx}-{name}_n{lig['count']}")
+            anion_idx += 1
+    parts.append(f"run{plan_item.get('repeat_idx', 0)}")
     return "_".join(parts) + ".xyz"
 
 
-# ==========================================
-# Worker Function for Parallel Processing
-# ==========================================
 def _worker_build_task(item: Dict, ion: str, xyz_dir: Path, cluster_kwargs: Dict) -> Tuple[
     bool, Optional[Dict], Optional[str]]:
-    """
-    Worker function to build a single cluster.
-    Returns: (success, result_metadata_dict_for_db, error_message)
-    """
     fname = compose_filename(ion, item)
-
     try:
         ligand_info_arg = []
         for lig in item['ligands']:
             atoms_obj = lig['entry']['atoms']
-            # Make a copy just in case
-            if isinstance(atoms_obj, Atoms):
-                atoms_obj = atoms_obj.copy()
-
+            if isinstance(atoms_obj, Atoms): atoms_obj = atoms_obj.copy()
             if lig['type'] == 'anion' and isinstance(atoms_obj, Atoms):
                 atoms_obj.charge = -1
                 atoms_obj.set_initial_charges(np.full(len(atoms_obj), -1 / len(atoms_obj)))
             ligand_info_arg.append((atoms_obj, lig['count']))
 
-        # CPU-intensive part
-        cluster = build_cluster(
-            ion_identifier=ion,
-            ligand_molecule_info=ligand_info_arg,
-            **cluster_kwargs
-        )
-
+        cluster = build_cluster(ion_identifier=ion, ligand_molecule_info=ligand_info_arg, **cluster_kwargs)
         cluster.info['charge'] = item['charge']
         cluster.info['category'] = item['category']
 
@@ -380,9 +272,7 @@ def _worker_build_task(item: Dict, ion: str, xyz_dir: Path, cluster_kwargs: Dict
                 atom.charge = 1.0
                 break
 
-        # Parallel file write is safe if filenames are unique
         write(str(xyz_dir / fname), cluster)
-
         kvp = {
             'category': item['category'],
             'ion': ion,
@@ -390,74 +280,44 @@ def _worker_build_task(item: Dict, ion: str, xyz_dir: Path, cluster_kwargs: Dict
             'total_coord': item['total_coord'],
             'n_atoms': len(cluster),
             'filename': fname,
-            'mix_type': item.get('mix_type', 'unknown')
+            'mix_type': item.get('mix_type', 'unknown'),
+            'repeat_idx': item.get('repeat_idx', 0),
+            'n_solvent': item['n_solvent_total'],
+            'n_anion': item['n_anion_total']
         }
         for i, lig in enumerate(item['ligands']):
             kvp[f"lig_{i}_name"] = lig['entry']['name']
             kvp[f"lig_{i}_type"] = lig['type']
             kvp[f"lig_{i}_count"] = lig['count']
-
-        # We must return the atoms object to the main process to write to DB
-        # But pickling large objects back can be slow.
-        # Since we already wrote the XYZ, maybe we reload it or just pass it back.
-        # Passing it back is usually fine for these sizes.
-
         return True, (cluster, kvp), None
-
     except Exception as e:
         return False, None, str(e)
 
 
-def build_from_plan(
-        plan: List[Dict],
-        out_dir: Path,
-        ion: str,
-        cluster_kwargs: Dict,
-        show_progress: bool,
-        n_jobs: int = 32  # Added n_jobs
-) -> Dict[str, int]:
+def build_from_plan(plan: List[Dict], out_dir: Path, ion: str, cluster_kwargs: Dict, show_progress: bool,
+                    n_jobs: int = 32) -> Dict[str, int]:
     stats = {'attempted': 0, 'built': 0, 'failed': 0}
-
     out_dir.mkdir(parents=True, exist_ok=True)
     db_path = out_dir / "structures.db"
     if db_path.exists(): os.remove(db_path)
-
-    # DB connection must remain in main process
     db = connect(db_path)
-
     xyz_dir = out_dir / "xyz"
     xyz_dir.mkdir(exist_ok=True)
 
     total_items = len(plan)
-
-    print(f"Starting parallel build with {n_jobs} workers...")
-
     with ProcessPoolExecutor(max_workers=n_jobs) as executor:
-        # Submit all tasks
-        futures = {
-            executor.submit(_worker_build_task, item, ion, xyz_dir, cluster_kwargs): item
-            for item in plan
-        }
-
-        # Process results as they complete
+        futures = {executor.submit(_worker_build_task, item, ion, xyz_dir, cluster_kwargs): item for item in plan}
         iterator = as_completed(futures)
-        if show_progress:
-            iterator = tqdm(iterator, total=total_items, desc="Building Clusters", unit="item")
-
+        if show_progress: iterator = tqdm(iterator, total=total_items, desc="Building Clusters", unit="item")
         for future in iterator:
             stats['attempted'] += 1
             success, data, error = future.result()
-
             if success:
                 cluster_obj, kvp = data
-                # Write to DB (Sequential, safe)
                 db.write(cluster_obj, data=kvp, **kvp)
                 stats['built'] += 1
             else:
                 stats['failed'] += 1
-                # Optional: print error if verbose
-                print(f"Failed: {error}")
-
     return stats
 
 
@@ -466,140 +326,86 @@ def entry(
         anions: Union[str, List[str]],
         out_dir: str = 'out_mixture',
         ion: str = 'Li',
-        target_totals: Tuple[int, ...] = (4, 5),
-        anion_counts: Tuple[int, ...] = (1,),
+        states: List[Tuple[int, int]] = [(3, 1), (4, 1)],  # (n_solvent, n_anion)
         mix_n_list: Tuple[int, ...] = (1,),
+        anion_mix_n_list: Tuple[int, ...] = (1,),
         num_mixtures: int = 10,
+        repeats: int = 1,
         use_uma: bool = True,
         device: str = "cuda",
         verbose: bool = True,
         show_progress: bool = True,
-        n_jobs: int = 32,  # Added n_jobs arg
+        n_jobs: int = 32,
         **cluster_kwargs
 ):
-    # 1. Load Data
     solv_data = normalize_input_data(solvents, "Solvent", show_progress, out_dir, device, use_uma)
     anion_data = normalize_input_data(anions, "Anion", show_progress, out_dir, device, use_uma)
 
-    if not solv_data:
-        raise ValueError("No solvent data found.")
+    if not solv_data: raise ValueError("No solvent data found.")
 
-    # 2. Plan
-    full_plan = []
-    print(f"\nGenerating Plans for Mix sizes: {mix_n_list}")
+    full_plan = plan_mixtures(
+        solvents_pool=solv_data, anions_pool=anion_data,
+        solv_mix_n_list=mix_n_list, anion_mix_n_list=anion_mix_n_list,
+        num_mixtures=num_mixtures, states=states, repeats=repeats
+    )
 
-    for m_n in mix_n_list:
-        sub_plan = plan_mixtures(
-            solvents_pool=solv_data,
-            anions_pool=anion_data,
-            mix_n=m_n,
-            num_mixtures=num_mixtures,
-            target_totals=target_totals,
-            anion_counts=anion_counts
-        )
-        full_plan.extend(sub_plan)
-
-    print(f"Total Plan: {len(full_plan)} configurations.")
-    if len(full_plan) == 0:
+    total_tasks = len(full_plan)
+    if total_tasks == 0:
         print("Plan is empty. Check constraints.")
         return
 
-    # 3. Build (Strict hyperparameters from snippet)
-    final_kwargs = dict(
-        relative_score_threshold=0.8,
-        max_patch_atoms=2,
-        initial_sphere_skin_factor=0.7,
-        sphere_skin_increment_factor=0.01,
-        target_no_clashes=True,
-        rotation_opt_iterations=50,
-        max_sphere_expansions=100,
-        verbose=False
-    )
+    # --- Print Preview by States ---
+    state_map = {}
+    for task in full_plan:
+        state_key = (task['n_solvent_total'], task['n_anion_total'])
+        if state_key not in state_map: state_map[state_key] = []
+        state_map[state_key].append(task)
+
+    print("\n" + "=" * 65)
+    print("=== Generation Plan Summary ===")
+    print(f"Total Tasks in Pool: {total_tasks}")
+    print("-" * 65)
+
+    for state_key in sorted(state_map.keys(), key=lambda x: (x[0] + x[1], x[1])):
+        n_solv, n_ani = state_key
+        cat = "SSIP" if n_ani == 0 else ("CIP" if n_ani == 1 else "AGG")
+        count = len(state_map[state_key])
+        pct = (count / total_tasks) * 100
+        print(f"  State {n_solv:>2} Solv : {n_ani:>2} Anion ({cat:<4}) | {count:>6} tasks | {pct:>5.1f}%")
+
+    print("-" * 65)
+    print("--- Preview (Sampled up to 5 per state) ---")
+
+    for state_key in sorted(state_map.keys(), key=lambda x: (x[0] + x[1], x[1])):
+        n_solv, n_ani = state_key
+        cat = "SSIP" if n_ani == 0 else ("CIP" if n_ani == 1 else "AGG")
+        items = state_map[state_key]
+
+        print(f"\n[State: {n_solv} Solv : {n_ani} Anion ({cat})]")
+        sample_tasks = random.sample(items, min(5, len(items)))
+
+        for i, task in enumerate(sample_tasks):
+            ligand_strs = [f"{l['count']}x {l['entry']['name']} ({l['type']})" for l in task['ligands']]
+            mix_str = " + ".join(ligand_strs)
+            print(f"  {i + 1}. Coord={task['total_coord']} | {mix_str} | Repeat: #{task['repeat_idx']}")
+
+    print("=" * 65 + "\n")
+
+    final_kwargs = dict(relative_score_threshold=0.8, max_patch_atoms=2, initial_sphere_skin_factor=0.7,
+                        sphere_skin_increment_factor=0.01, target_no_clashes=True, rotation_opt_iterations=50,
+                        max_sphere_expansions=100, verbose=False)
     final_kwargs.update(cluster_kwargs)
 
     out_path = Path(out_dir)
-    # Pass n_jobs to build_from_plan
     stats = build_from_plan(full_plan, out_path, ion, final_kwargs, show_progress, n_jobs=n_jobs)
+    print(f"\nBuild Done: {stats['built']}/{stats['attempted']} success.")
 
-    print(f"Build Done: {stats['built']}/{stats['attempted']} success.")
-
-    # 4. Post-Build Optimization (UMA) - only if requested and available
     if use_uma and UMA_AVAILABLE and stats['built'] > 0:
         raw_db = str(out_path / "structures.db")
         opt_dir = out_path / "optimized"
         print(f"\nRunning UMA Optimization on {raw_db}...")
         try:
-            uma_entry.entry(
-                input_db=raw_db,
-                workspace=str(opt_dir),
-                device=device,
-                verbose=verbose,
-                show_progress=show_progress
-            )
+            uma_entry.entry(input_db=raw_db, workspace=str(opt_dir), device=device, verbose=verbose,
+                            show_progress=show_progress)
         except Exception as e:
             print(f"UMA Optimization crashed: {e}")
-    elif use_uma and not UMA_AVAILABLE:
-        print("\n[Warning] Post-build optimization skipped because 'uma_entry' module is missing.")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Build Multi-Component Clusters")
-
-    # Inputs
-    parser.add_argument('--solvents', nargs='*', default=None, help="SMILES or DB path for solvents")
-    parser.add_argument('--anions', nargs='*', default=None, help="SMILES or DB path for anions")
-    parser.add_argument('--out', default='out_mixture', help="Output directory")
-
-    # Configuration
-    parser.add_argument('--ion', default='Li', help="Ion identifier")
-    parser.add_argument('--target-totals', default='4,5', help="Allowed total coordination numbers")
-    parser.add_argument('--anion-counts', default='1', help="Allowed anion counts")
-
-    # Mixture Logic
-    parser.add_argument('--mix-n', default='1', help="List of mix sizes (e.g. '1,2')")
-    parser.add_argument('--num-mixtures', type=int, default=10, help="Max random solvent combinations")
-
-    # Parallelism
-    parser.add_argument('--workers', type=int, default=64, dest='n_jobs',
-                        help="Number of parallel build processes (default: 32)")
-
-    # Flags
-    parser.add_argument('--no-uma', action='store_false', dest='use_uma', help="Disable UMA pre/post-optimization")
-    parser.set_defaults(use_uma=True)
-
-    parser.add_argument('--device', default='cuda')
-    parser.add_argument('--verbose', action='store_true')
-
-    args = parser.parse_args()
-
-    # Parsing lists
-    solv_arg = args.solvents if args.solvents else [DEFAULT_DME_SMILES]
-    if len(solv_arg) == 1 and (solv_arg[0].endswith('.db') or solv_arg[0].endswith('.json')):
-        solv_arg = solv_arg[0]
-
-    anion_arg = args.anions if args.anions else [DEFAULT_FSI_SMILES]
-    if len(anion_arg) == 1 and (anion_arg[0].endswith('.db') or anion_arg[0].endswith('.json')):
-        anion_arg = anion_arg[0]
-
-    t_totals = tuple(int(x) for x in args.target_totals.split(',') if x.strip())
-    a_counts = tuple(int(x) for x in args.anion_counts.split(',') if x.strip())
-    m_n_list = tuple(int(x) for x in args.mix_n.split(',') if x.strip())
-
-    entry(
-        solvents=solv_arg,
-        anions=anion_arg,
-        out_dir=args.out,
-        ion=args.ion,
-        target_totals=t_totals,
-        anion_counts=a_counts,
-        mix_n_list=m_n_list,
-        num_mixtures=args.num_mixtures,
-        use_uma=args.use_uma,
-        device=args.device,
-        verbose=args.verbose,
-        n_jobs=args.n_jobs  # Pass n_jobs
-    )
-
-
-if __name__ == "__main__":
-    main()

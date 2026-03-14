@@ -557,13 +557,13 @@ def dm_infer_entry(
                 ##################
                 Zsum = int(an_atoms.get_atomic_numbers().sum())
                 Ne_pred = get_electron_number_from_dm(pred_dm, overlap)
-                q_from_dm = Zsum - Ne_pred  # DM 隐含出来的“电荷”(化学定义)
+                charge_from_dm_infer = Zsum - Ne_pred  # DM 隐含出来的“电荷”(化学定义)
 
                 print("Zsum", Zsum,
                       "charge(db)", current_mol_charge,
                       "expected Ne", Zsum - current_mol_charge,
                       "Ne_pred", Ne_pred,
-                      "q_from_dm", q_from_dm)
+                      "charge_from_dm_infer", charge_from_dm_infer)
                 ##################
 
                 electronic_info = None

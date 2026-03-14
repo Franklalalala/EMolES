@@ -193,9 +193,18 @@ def save_atomic_structure(atomic_data, atomic_nums, db_path, an_err=None, additi
     if 'charge' in atomic_data.keys():
         charge = atomic_data['charge'].cpu().numpy()
         data_content.update({'charge': int(charge)})
+
     if 'dielectric_constant' in atomic_data.keys():
         dielectric_constant = atomic_data['dielectric_constant'].cpu().numpy()
         data_content.update({'dielectric_constant': float(dielectric_constant)})
+
+    if 'HOMO_eV' in atomic_data.keys():
+        HOMO_eV = atomic_data['HOMO_eV'].cpu().numpy()
+        data_content.update({'HOMO_eV': float(HOMO_eV)})
+        LUMO_eV = atomic_data['LUMO_eV'].cpu().numpy()
+        data_content.update({'LUMO_eV': float(LUMO_eV)})
+        GAP_eV = atomic_data['GAP_eV'].cpu().numpy()
+        data_content.update({'GAP_eV': float(GAP_eV)})
 
     with connect(db_path) as db:
         if data_content:
