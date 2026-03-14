@@ -89,7 +89,7 @@ def _fallback_smiles_to_atoms(smiles: str) -> Atoms:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Reference‑DB InChI lookup  (skip UMA when geometry already exists)
+# Reference‑DB InChI lookup (skip UMA when geometry already exists)
 # ═══════════════════════════════════════════════════════════════════════════════
 def _build_inchi_atoms_map(db_path: str) -> Dict[str, Tuple[str, Atoms]]:
     """Return ``{inchi: (row_name, atoms)}`` built from *db_path*."""
@@ -103,7 +103,6 @@ def _build_inchi_atoms_map(db_path: str) -> Dict[str, Tuple[str, Atoms]]:
             name = kv.get("name") or getattr(row, "name", None) or f"ref_{row.id}"
 
             inchi = kv.get("inchi") or getattr(row, "inchi", None)
-
             if not inchi:
                 smiles = kv.get("Smiles") or kv.get("smiles")
                 if smiles:
@@ -111,7 +110,6 @@ def _build_inchi_atoms_map(db_path: str) -> Dict[str, Tuple[str, Atoms]]:
                         inchi = smile_to_inchi(smiles)
                     except Exception:
                         pass
-
             if not inchi:
                 try:
                     smiles = atom_2_smile(row.toatoms())
@@ -261,7 +259,6 @@ def optimize_monomers(
 
     if not optimized_db_path or not os.path.exists(optimized_db_path):
         return load_db_entries(input_db_path, show_progress=False, source_tag="uma_fallback_raw")
-
     return load_db_entries(optimized_db_path, show_progress=False, source_tag="uma_optimized")
 
 
@@ -280,22 +277,17 @@ def normalize_input_data(
     if source is None:
         return []
 
-    # Already a resolved list of dicts
     if isinstance(source, list) and source and isinstance(source[0], dict):
         return source
 
-    # DB file path
     if isinstance(source, str) and (source.endswith(".db") or source.endswith(".json")):
         return load_db_entries(source, show_progress)
 
-    # SMILES string(s)
     s_list = [source] if isinstance(source, str) else source
     raw_entries = parse_smiles_input(s_list, prefix)
 
-    # Step 1: look up in ref DB by InChI – matched entries skip optimisation
     found, remaining = _resolve_entries_via_ref_db(raw_entries, prefix, ref_db_for_lookup)
 
-    # Step 2: optimise whatever is left
     if remaining:
         optimised = optimize_monomers(remaining, prefix, workspace, device, use_uma)
         found.extend(optimised)
@@ -320,38 +312,36 @@ def integer_partitions(target: int, k: int, min_val: int = 1) -> Generator[Tuple
 def plan_mixtures(
     solvents_pool: List[Dict],
     anions_pool: List[Dict],
-    solv_mix_n_list: Tuple[int, ...],
-    anion_mix_n_list: Tuple[int, ...],
-    num_mixtures: int,
+    solvent_mix_sizes: Tuple[int, ...],
+    anion_mix_sizes: Tuple[int, ...],
     states: List[Tuple[int, int]],
     repeats: int = 1,
     seed: int = 42,
 ) -> List[Dict]:
+    """
+    Enumerate all valid cluster compositions.
+
+    Parameters
+    ----------
+    solvent_mix_sizes : tuple of int
+        How many *distinct* solvent species to mix in one cluster (e.g. (1,) = pure,
+        (1, 2) = also try binary mixtures).
+    anion_mix_sizes : tuple of int
+        How many *distinct* anion species to mix in one cluster.
+    states : list of (n_solvent, n_anion)
+        Each pair specifies the total molecule count of solvent and anion around the ion.
+    """
     plan: List[Dict] = []
     random.seed(seed)
     unique_signatures: set = set()
 
-    for s_mix_n in solv_mix_n_list:
+    for s_mix_n in solvent_mix_sizes:
         if s_mix_n > len(solvents_pool):
             continue
 
-        n_total_combos = math.comb(len(solvents_pool), s_mix_n)
-        if s_mix_n == 1:
-            solvent_combinations = [(s,) for s in solvents_pool]
-        elif n_total_combos <= num_mixtures * 2:
-            solvent_combinations = list(itertools.combinations(solvents_pool, s_mix_n))
-        else:
-            solvent_combinations: list = []
-            seen: set = set()
-            attempts = 0
-            while len(solvent_combinations) < num_mixtures and attempts < num_mixtures * 10:
-                combo = tuple(sorted(random.sample(solvents_pool, s_mix_n), key=lambda x: x["name"]))
-                if combo not in seen:
-                    seen.add(combo)
-                    solvent_combinations.append(combo)
-                attempts += 1
+        solvent_combinations = list(itertools.combinations(solvents_pool, s_mix_n))
 
-        for a_mix_n in anion_mix_n_list:
+        for a_mix_n in anion_mix_sizes:
             anion_combinations: list = []
             if anions_pool and a_mix_n <= len(anions_pool):
                 anion_combinations = list(itertools.combinations(anions_pool, a_mix_n))
@@ -530,7 +520,7 @@ def build_from_plan(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Dielectric‑constant annotation
+# Dielectric‑constant: ref‑DB loading & matching
 # ═══════════════════════════════════════════════════════════════════════════════
 def load_ref_monomer_db(ref_db_path: str) -> Tuple[List[Dict], Dict[str, Dict]]:
     if not os.path.exists(ref_db_path):
@@ -592,11 +582,103 @@ def best_match_by_inchi_or_fp(
     return {"matched_by": "fp_tanimoto_best", "similarity": float(best_sim), "ref": best}
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Dielectric‑constant: resolve per‑solvent ε + pure‑anion fallback
+# ═══════════════════════════════════════════════════════════════════════════════
+def resolve_solvent_dielectric_constants(
+    solvent_pool: List[Dict],
+    ref_db_path: str,
+    states: List[Tuple[int, int]],
+) -> Optional[float]:
+    """
+    Look up dielectric constant (ε) for every solvent in the pool from *ref_db_path*
+    and print a detailed report so the user knows how each ε was determined.
+
+    If any requested state has ``n_solvent == 0`` (pure‑anion cluster), computes a
+    fallback ε = arithmetic mean of all resolved solvent ε values.
+
+    Returns
+    -------
+    fallback_dc : float or None
+        The fallback ε for pure‑anion clusters, or *None* if no such states exist.
+    """
+    has_pure_anion = any(n_s == 0 for n_s, _ in states)
+
+    if not solvent_pool or not ref_db_path or not os.path.exists(ref_db_path):
+        if has_pure_anion:
+            print("\n  ⚠  Pure‑anion states requested but ref DB is unavailable for ε lookup.")
+        return None
+
+    try:
+        ref_rows, inchi_map = load_ref_monomer_db(ref_db_path)
+    except Exception as e:
+        print(f"\n  ⚠  Cannot load ref DB for ε resolution: {e}")
+        return None
+
+    dc_values: List[float] = []
+
+    print("\n" + "=" * 78)
+    print("  Solvent Dielectric Constant (ε) Resolution")
+    print("  Method: each solvent is matched to the ref DB via InChI or MACCS fingerprint;")
+    print("          ε is then read from the matched reference entry.")
+    print("-" * 78)
+
+    for s in solvent_pool:
+        atoms_obj = s["atoms"]
+        name = s["name"]
+        try:
+            smiles = atom_2_smile(atoms_obj) if isinstance(atoms_obj, Atoms) else str(atoms_obj)
+            inchi = smile_to_inchi(smiles)
+            match = best_match_by_inchi_or_fp(inchi, smiles, ref_rows, inchi_map)
+            ref = match["ref"]
+            dc = ref.get("dielectric_constant")
+
+            if dc is not None:
+                dc_values.append(float(dc))
+                print(
+                    f"    {name:<22s} → ε = {dc:<8.2f}  "
+                    f"(ref='{ref['name']}', {match['matched_by']}, sim={match['similarity']:.3f})"
+                )
+            else:
+                print(
+                    f"    {name:<22s} → ε = N/A      "
+                    f"(ref='{ref['name']}' has no ε value)"
+                )
+        except Exception as e:
+            print(f"    {name:<22s} → ε = ERROR    ({e})")
+
+    fallback_dc: Optional[float] = None
+
+    if has_pure_anion:
+        print("-" * 78)
+        if dc_values:
+            fallback_dc = sum(dc_values) / len(dc_values)
+            print(f"  ⚠  Pure‑anion states detected (n_solvent = 0).")
+            print(f"     These clusters contain no solvent → ε cannot be derived from composition.")
+            print(f"     Fallback ε = mean of all input solvents = {fallback_dc:.4f}")
+        else:
+            print(f"  ⚠  Pure‑anion states detected but no valid solvent ε was resolved.")
+            print(f"     These clusters will have NO ε annotation.")
+
+    print("=" * 78)
+    return fallback_dc
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Dielectric‑constant: annotate built structures DB
+# ═══════════════════════════════════════════════════════════════════════════════
 def annotate_db_with_weighted_dc(
     opt_db_path: str,
     ref_db_path: str,
+    fallback_dc: Optional[float] = None,
     show_progress: bool = True,
 ) -> None:
+    """
+    Walk every row in *opt_db_path*, compute a count‑weighted ε from its solvent
+    ligands, and write back ``dielectric_constant`` + detailed provenance.
+
+    For pure‑anion rows (0 solvent molecules) the *fallback_dc* is used instead.
+    """
     ref_rows, inchi_map = load_ref_monomer_db(ref_db_path)
 
     with connect(opt_db_path) as db:
@@ -629,9 +711,21 @@ def annotate_db_with_weighted_dc(
                 i += 1
 
             total_count = sum(lg["count"] for lg in ligands)
+
+            # ── Pure‑anion row: use fallback ε ────────────────────────────
             if total_count == 0:
+                if fallback_dc is not None:
+                    data["dielectric_constant_weighted_detail"] = {
+                        "ref_db": ref_db_path,
+                        "dielectric_constant_weighted": float(fallback_dc),
+                        "components": [],
+                        "weighting": "fallback_mean_of_all_input_solvents",
+                        "note": "Pure‑anion cluster (n_solvent=0); ε = mean of all input solvents.",
+                    }
+                    db.update(row.id, dielectric_constant=float(fallback_dc), data=data)
                 continue
 
+            # ── Normal weighted ε ─────────────────────────────────────────
             dc_weighted = 0.0
             components = []
 
@@ -777,20 +871,20 @@ def postprocess(
     verbose: bool,
     show_progress: bool,
     n_built: int,
+    fallback_dc: Optional[float] = None,
 ) -> None:
+    target_db = raw_db_path
     if use_uma and UMA_AVAILABLE and n_built > 0:
         opt_dir = out_path / "optimized"
         print(f"\nRunning UMA Optimisation on {raw_db_path} ...")
-        optimized_db_path = uma_entry.entry(
+        target_db = uma_entry.entry(
             input_db=raw_db_path,
             workspace=str(opt_dir),
             device=device,
             verbose=verbose,
             show_progress=show_progress,
         )
-        annotate_db_with_weighted_dc(optimized_db_path, ref_db_path, show_progress)
-    else:
-        annotate_db_with_weighted_dc(raw_db_path, ref_db_path, show_progress)
+    annotate_db_with_weighted_dc(target_db, ref_db_path, fallback_dc, show_progress)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -803,9 +897,8 @@ def entry(
     out_dir: str = "out_mixture",
     ion: str = "Li",
     states: List[Tuple[int, int]] = [(3, 1), (4, 1)],
-    mix_n_list: Tuple[int, ...] = (1,),
-    anion_mix_n_list: Tuple[int, ...] = (1,),
-    num_mixtures: int = 10,
+    solvent_mix_sizes: Tuple[int, ...] = (1,),
+    anion_mix_sizes: Tuple[int, ...] = (1,),
     repeats: int = 1,
     use_uma: bool = True,
     device: str = "cuda",
@@ -814,6 +907,20 @@ def entry(
     n_jobs: int = 32,
     **cluster_kwargs,
 ):
+    """
+    End‑to‑end pipeline: resolve monomers → plan mixtures → build clusters →
+    (optional) UMA optimise → annotate dielectric constants.
+
+    Parameters
+    ----------
+    solvent_mix_sizes : tuple of int
+        Number of *distinct* solvent species per cluster.
+        ``(1,)`` = single‑solvent; ``(1, 2)`` = also try binary mixtures.
+    anion_mix_sizes : tuple of int
+        Number of *distinct* anion species per cluster.
+    states : list of (n_solvent, n_anion)
+        Each pair gives the molecule count of solvent and anion around the ion.
+    """
     # ── 1. Resolve monomers (ref‑DB lookup → UMA / fallback) ──────────────
     solv_data = normalize_input_data(
         solvents, "Solvent", show_progress, out_dir, device, use_uma,
@@ -830,13 +937,15 @@ def entry(
     # ── 2. Show where every monomer came from ─────────────────────────────
     print_monomer_sources(solv_data, anion_data)
 
-    # ── 3. Plan mixtures ──────────────────────────────────────────────────
+    # ── 3. Resolve per‑solvent ε & pure‑anion fallback ────────────────────
+    fallback_dc = resolve_solvent_dielectric_constants(solv_data, ref_db_path, states)
+
+    # ── 4. Plan mixtures ──────────────────────────────────────────────────
     full_plan = plan_mixtures(
         solvents_pool=solv_data,
         anions_pool=anion_data,
-        solv_mix_n_list=mix_n_list,
-        anion_mix_n_list=anion_mix_n_list,
-        num_mixtures=num_mixtures,
+        solvent_mix_sizes=solvent_mix_sizes,
+        anion_mix_sizes=anion_mix_sizes,
         states=states,
         repeats=repeats,
     )
@@ -847,15 +956,19 @@ def entry(
 
     print_plan_summary(full_plan)
 
-    # ── 4. Build clusters ─────────────────────────────────────────────────
+    # ── 5. Build clusters ─────────────────────────────────────────────────
     out_path = Path(out_dir)
     final_kwargs = _default_cluster_kwargs(**cluster_kwargs)
     stats = build_from_plan(full_plan, out_path, ion, final_kwargs, show_progress, n_jobs=n_jobs)
     print(f"\nBuild Done: {stats['built']}/{stats['attempted']} success.")
 
-    # ── 5. Post‑build UMA optimisation + DC annotation ────────────────────
+    # ── 6. Post‑build UMA optimisation + ε annotation ─────────────────────
     raw_db = str(out_path / "structures.db")
-    postprocess(raw_db, ref_db_path, out_path, use_uma, device, verbose, show_progress, stats["built"])
+    postprocess(
+        raw_db, ref_db_path, out_path,
+        use_uma, device, verbose, show_progress,
+        stats["built"], fallback_dc,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -866,15 +979,12 @@ if __name__ == "__main__":
     parser.add_argument("--solvents", type=str, default=DEFAULT_DME_SMILES, help="SMILES or db path")
     parser.add_argument("--anions", type=str, default=DEFAULT_FSI_SMILES, help="SMILES or db path")
     parser.add_argument(
-        "--ref_db_path",
-        type=str,
-        default=DEFAULT_REF_DB_PATH,
+        "--ref_db_path", type=str, default=DEFAULT_REF_DB_PATH,
         help="Solvent ref db (must contain: inchi, dielectric_constant, data['maccs_fp'])",
     )
     parser.add_argument("--out_dir", type=str, default="out_mixture")
     parser.add_argument("--ion", type=str, default="Li")
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--num_mixtures", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--use_uma", action="store_false", default=True)
     parser.add_argument("--n_jobs", type=int, default=32)
@@ -886,7 +996,6 @@ if __name__ == "__main__":
         ref_db_path=args.ref_db_path,
         out_dir=args.out_dir,
         ion=args.ion,
-        num_mixtures=args.num_mixtures,
         repeats=args.repeats,
         use_uma=args.use_uma,
         device=args.device,
