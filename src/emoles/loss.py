@@ -288,7 +288,13 @@ def process_dm_loss_dict(data, key="pred_vs_label"):
         processed["PySCF-LUMO-Err (eV)"] = data["pyscf_LUMO"]
     if "pyscf_GAP" in data:
         processed["PySCF-GAP-Err (eV)"] = data["pyscf_GAP"]
-    # ================= 更改结束 =================
+
+    if "ai_pyscf_HOMO" in data:
+        processed["AI-PySCF-HOMO-Err (eV)"] = data["ai_pyscf_HOMO"]
+    if "ai_pyscf_LUMO" in data:
+        processed["AI-PySCF-LUMO-Err (eV)"] = data["ai_pyscf_LUMO"]
+    if "ai_pyscf_GAP" in data:
+        processed["AI-PySCF-GAP-Err (eV)"] = data["ai_pyscf_GAP"]
 
     # Orbital Similarities
     if "HOMO_coefficients" in data:
@@ -970,6 +976,9 @@ def evaluate_dm_from_npy(
                     errors["pyscf_LUMO"] = abs(pyscf_lumo_ev - gaussian_lumo)
                     errors["pyscf_GAP"] = abs(pyscf_gap_ev - gaussian_gap)
 
+                    errors["ai_pyscf_HOMO"] = abs(pred_homo_ev - pyscf_homo_ev)
+                    errors["ai_pyscf_LUMO"] = abs(pred_lumo_ev - pyscf_lumo_ev)
+                    errors["ai_pyscf_GAP"] = abs(pred_gap_ev - pyscf_gap_ev)
                     # Criterion 对比：必须使用 GAS，避免将 PCM 带来的非物理形变纳入损失评估
                     eval_keys = [
                         "hamiltonian",
