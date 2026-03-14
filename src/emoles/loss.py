@@ -757,23 +757,23 @@ def calculate_properties_from_dm(
 
 
 def evaluate_dm_from_npy(
-    abs_ase_path,
-    npy_folder_path,
-    convention="def2svp",
-    mol_charge=0,
-    pred_dm_filename="predicted_dm.npy",
-    target_dm_filename="target_dm.npy",
-    transform_dm_flag=True,
-    get_esp_sta_flag=True,
-    get_ham_flag=True,
-    keep_xyz_file=True,
-    n_save_cube_items: int = 5,
-    temp_data_file: str = "temp_cube_data.pkl",
-    max_items: int = 300,
-    gen_esp_cube_flag: bool = False,
-    summary_filename="evaluation_summary.npz",
-    pcm_eps: float = 25,
-    verbose_profiling: bool = False,
+        abs_ase_path,
+        npy_folder_path,
+        convention="def2svp",
+        mol_charge=0,
+        pred_dm_filename="predicted_dm.npy",
+        target_dm_filename="target_dm.npy",
+        transform_dm_flag=True,
+        get_esp_sta_flag=True,
+        get_ham_flag=True,
+        keep_xyz_file=True,
+        n_save_cube_items: int = 5,
+        temp_data_file: str = "temp_cube_data.pkl",
+        max_items: int = 300,
+        gen_esp_cube_flag: bool = False,
+        summary_filename="evaluation_summary.npz",
+        pcm_eps: float = 25,
+        verbose_profiling: bool = False,
 ):
     import time
     import json
@@ -891,53 +891,58 @@ def evaluate_dm_from_npy(
                 electronic_properties_eV = None
 
                 # 2) DM 推导的电子性质 / Ham / 轨道等
-                mf_shared = None
-                pred_props = None
-                target_props = None
+                mf_gas = None
+                pred_props_gas = None
+                target_props_gas = None
 
                 if get_ham_flag:
                     current_pcm_eps = a_row.data.get("dielectric_constant", pcm_eps)
 
-                    # 共享 mf：pred/target 复用
-                    mf_shared = pyscf.dft.RKS(mol)
-                    mf_shared.xc = "b3lyp"
+                    # --- 解耦逻辑：分为 GAS (查形状) 和 PCM (查能量) ---
+                    mf_gas = pyscf.dft.RKS(mol)
+                    mf_gas.xc = "b3lyp"
 
+                    mf_pcm = pyscf.dft.RKS(mol)
+                    mf_pcm.xc = "b3lyp"
                     if current_pcm_eps is not None and current_pcm_eps > 1.0:
-                        mf_shared = mf_shared.PCM()
-                        mf_shared.with_solvent.eps = current_pcm_eps
-                        mf_shared.with_solvent.method = 'IEF-PCM'
+                        mf_pcm = mf_pcm.PCM()
+                        mf_pcm.with_solvent.eps = current_pcm_eps
+                        mf_pcm.with_solvent.method = 'IEF-PCM'
                         uff_radii_tb = build_uff_radii_table()
-                        mf_shared.with_solvent.radii_table = 1.1 * uff_radii_tb
-                        mf_shared.with_solvent.lebedev_order = 31
+                        mf_pcm.with_solvent.radii_table = 1.1 * uff_radii_tb
+                        mf_pcm.with_solvent.lebedev_order = 31
 
                     t_mf = time.time()
-                    _log_time(f"[{idx}] [Time] Init shared Mean-Field:     {t_mf - t_basic_err:.4f} s")
+                    _log_time(f"[{idx}] [Time] Init Gas & PCM Mean-Fields: {t_mf - t_basic_err:.4f} s")
 
-                    pred_props = get_electronic_properties(
-                        mol, dm=pred_dm, overlap=overlap, pcm_eps=current_pcm_eps, mf=mf_shared
-                    )
-                    t_prop_pred = time.time()
-                    _log_time(f"[{idx}] [Time] Get Props (Pred get_fock):  {t_prop_pred - t_mf:.4f} s")
+                    # [GAS] 提取本征形貌
+                    pred_props_gas = get_electronic_properties(mol, dm=pred_dm, overlap=overlap, mf=mf_gas)
+                    target_props_gas = get_electronic_properties(mol, dm=target_dm, overlap=overlap, mf=mf_gas)
 
-                    target_props = get_electronic_properties(
-                        mol, dm=target_dm, overlap=overlap, pcm_eps=current_pcm_eps, mf=mf_shared
+                    # [PCM] 提取微扰能量
+                    pred_props_pcm = get_electronic_properties(
+                        mol, dm=pred_dm, overlap=overlap, pcm_eps=current_pcm_eps, mf=mf_pcm
                     )
-                    t_prop_tgt = time.time()
-                    _log_time(f"[{idx}] [Time] Get Props (Target get_fock):{t_prop_tgt - t_prop_pred:.4f} s")
+                    target_props_pcm = get_electronic_properties(
+                        mol, dm=target_dm, overlap=overlap, pcm_eps=current_pcm_eps, mf=mf_pcm
+                    )
+
+                    t_prop = time.time()
+                    _log_time(f"[{idx}] [Time] Get Props (Gas + PCM):      {t_prop - t_mf:.4f} s")
 
                     # Gaussian label (eV)
                     gaussian_homo = a_row.data.get("HOMO_eV", 0.0)
                     gaussian_lumo = a_row.data.get("LUMO_eV", 0.0)
                     gaussian_gap = a_row.data.get("GAP_eV", gaussian_lumo - gaussian_homo)
 
-                    # ======= (需求2) 存“数值本身”，不是 error =======
-                    pred_homo_ev = float(pred_props["HOMO"]) * Hartree
-                    pred_lumo_ev = float(pred_props["LUMO"]) * Hartree
-                    pred_gap_ev = float(pred_props["GAP"]) * Hartree
+                    # ======= (需求2) 存“数值本身”，使用 PCM 修正过的能量 =======
+                    pred_homo_ev = float(pred_props_pcm["HOMO"]) * Hartree
+                    pred_lumo_ev = float(pred_props_pcm["LUMO"]) * Hartree
+                    pred_gap_ev = float(pred_props_pcm["GAP"]) * Hartree
 
-                    pyscf_homo_ev = float(target_props["HOMO"]) * Hartree
-                    pyscf_lumo_ev = float(target_props["LUMO"]) * Hartree
-                    pyscf_gap_ev = float(target_props["GAP"]) * Hartree
+                    pyscf_homo_ev = float(target_props_pcm["HOMO"]) * Hartree
+                    pyscf_lumo_ev = float(target_props_pcm["LUMO"]) * Hartree
+                    pyscf_gap_ev = float(target_props_pcm["GAP"]) * Hartree
 
                     electronic_properties_eV = {
                         "pred": {
@@ -945,7 +950,6 @@ def evaluate_dm_from_npy(
                             "LUMO_eV": pred_lumo_ev,
                             "GAP_eV": pred_gap_ev,
                         },
-                        # 这里的 pyscf 指“用 label/target DM 走 PySCF 得到的能级”
                         "pyscf": {
                             "HOMO_eV": pyscf_homo_ev,
                             "LUMO_eV": pyscf_lumo_ev,
@@ -958,16 +962,15 @@ def evaluate_dm_from_npy(
                         },
                     }
 
-                    # a) error: pred vs gaussian
                     errors["HOMO"] = abs(pred_homo_ev - gaussian_homo)
                     errors["LUMO"] = abs(pred_lumo_ev - gaussian_lumo)
                     errors["GAP"] = abs(pred_gap_ev - gaussian_gap)
 
-                    # b) error: pyscf(target_dm) vs gaussian
                     errors["pyscf_HOMO"] = abs(pyscf_homo_ev - gaussian_homo)
                     errors["pyscf_LUMO"] = abs(pyscf_lumo_ev - gaussian_lumo)
                     errors["pyscf_GAP"] = abs(pyscf_gap_ev - gaussian_gap)
 
+                    # Criterion 对比：必须使用 GAS，避免将 PCM 带来的非物理形变纳入损失评估
                     eval_keys = [
                         "hamiltonian",
                         "orbital_coefficients",
@@ -975,8 +978,8 @@ def evaluate_dm_from_npy(
                         "LUMO_coefficients",
                     ]
                     ham_orb_errors = criterion(
-                        pred_props,
-                        target_props,
+                        pred_props_gas,  # 传入不受微扰的形貌
+                        target_props_gas,
                         eval_keys,
                         flag=False,
                         atoms=an_atoms,
@@ -985,7 +988,7 @@ def evaluate_dm_from_npy(
                     errors.update(ham_orb_errors)
 
                     t_crit = time.time()
-                    _log_time(f"[{idx}] [Time] Criterion Matrix Ops:       {t_crit - t_prop_tgt:.4f} s")
+                    _log_time(f"[{idx}] [Time] Criterion Matrix Ops:       {t_crit - t_prop:.4f} s")
 
                     if idx < n_save_cube_items:
                         mol_info = {
@@ -1000,8 +1003,8 @@ def evaluate_dm_from_npy(
                             "idx": idx,
                             "HOMO_sim": errors.get("HOMO_coefficients", 0.0),
                             "mol_info": mol_info,
-                            "outputs": pred_props,
-                            "tgt_info": target_props,
+                            "outputs": pred_props_gas,  # 保存本征轨道用于画图
+                            "tgt_info": target_props_gas,
                         }
                         temp_cube_data.append(cube_item)
                 else:
@@ -1009,36 +1012,33 @@ def evaluate_dm_from_npy(
 
                 # 3) ESP / deformation
                 if get_esp_sta_flag:
-                    # ======= (需求1) 若 get_ham_flag 已算过 fock，则复用，避免重复 get_fock =======
-                    if get_ham_flag and (pred_props is not None) and (target_props is not None):
-                        # ================= 更改开始: 传入 mo_energy, mo_coeff 直接复用 =================
+                    # ESP 绝对不能受微扰，必须复用 mf_gas 和其算出的 coeff
+                    if get_ham_flag and (pred_props_gas is not None) and (target_props_gas is not None):
                         p_esp_max, p_esp_min, p_phi = calculate_properties_from_dm(
                             mol,
                             pred_dm,
                             "pred",
                             gen_dm_flag=gen_esp_cube_flag,
-                            mf=mf_shared,
-                            fock=pred_props.get("hamiltonian", None),
-                            overlap=pred_props.get("overlap", overlap),
-                            mo_energy=pred_props.get("mo_energy", None),
-                            mo_coeff=pred_props.get("mo_coeff", None),
-                            mo_occ=pred_props.get("mo_occ", None),
+                            mf=mf_gas,  # <--- 必须是气相 mf
+                            fock=pred_props_gas.get("hamiltonian", None),
+                            overlap=pred_props_gas.get("overlap", overlap),
+                            mo_energy=pred_props_gas.get("mo_energy", None),
+                            mo_coeff=pred_props_gas.get("mo_coeff", None),  # <--- 必须是气相 coeff
+                            mo_occ=pred_props_gas.get("mo_occ", None),
                         )
                         t_esp_max, t_esp_min, t_phi = calculate_properties_from_dm(
                             mol,
                             target_dm,
                             "target",
                             gen_dm_flag=gen_esp_cube_flag,
-                            mf=mf_shared,
-                            fock=target_props.get("hamiltonian", None),
-                            overlap=target_props.get("overlap", overlap),
-                            mo_energy=target_props.get("mo_energy", None),
-                            mo_coeff=target_props.get("mo_coeff", None),
-                            mo_occ=target_props.get("mo_occ", None),
+                            mf=mf_gas,
+                            fock=target_props_gas.get("hamiltonian", None),
+                            overlap=target_props_gas.get("overlap", overlap),
+                            mo_energy=target_props_gas.get("mo_energy", None),
+                            mo_coeff=target_props_gas.get("mo_coeff", None),
+                            mo_occ=target_props_gas.get("mo_occ", None),
                         )
-                        # ================= 更改结束 =================
                     else:
-                        # fallback: 维持旧逻辑（内部会 init mf + get_fock）
                         p_esp_max, p_esp_min, p_phi = calculate_properties_from_dm(
                             mol, pred_dm, "pred", gen_dm_flag=gen_esp_cube_flag
                         )
@@ -1060,15 +1060,13 @@ def evaluate_dm_from_npy(
                 if keep_xyz_file:
                     write("atomic_structure.xyz", an_atoms)
 
-                # 累加全局平均（只累加 errors，不包括电子性质的 raw values）
                 for key, val in errors.items():
                     if val is not None:
                         total_error_dict["pred_vs_label"][key] = (
-                            total_error_dict["pred_vs_label"].get(key, 0.0) + val
+                                total_error_dict["pred_vs_label"].get(key, 0.0) + val
                         )
                 total_error_dict["total_items"] += 1
 
-                # Save per-task JSON (加入 raw 值)
                 mol_info_log = {
                     "formula": an_atoms.get_chemical_formula(),
                     "charge": int(current_mol_charge),
@@ -1079,14 +1077,12 @@ def evaluate_dm_from_npy(
                     "mol_info": mol_info_log,
                     "errors": errors,
                 }
-                # (需求2) 写入 raw 电子性质值（非 error）
                 if electronic_properties_eV is not None:
                     local_result["electronic_properties_eV"] = electronic_properties_eV
 
                 with open("dm_evaluation_result.json", "w") as f_json:
                     json.dump(local_result, f_json, indent=4, default=str)
 
-                # summary npz 仍以 errors 为主；如果你也想把 raw 值写进 npz，可自行在这里 flat_data.update(...)
                 flat_data = {"idx": idx}
                 flat_data.update(errors)
                 summary_data_list.append(flat_data)
@@ -1139,7 +1135,6 @@ def evaluate_dm_from_npy(
         "Failed Items": fail_count
     })
     return result_dict
-
 
 def get_mae_from_npy(
         abs_ase_path,

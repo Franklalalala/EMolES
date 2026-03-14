@@ -495,9 +495,6 @@ def dm_infer_entry(
             return x.tolist()
         return x
 
-
-    # Import here to keep function self-contained/replaceable
-    # build_uff_radii_table lives in emoles.loss module (your loss file)
     try:
         from emoles.loss import build_uff_radii_table
     except Exception:
@@ -533,7 +530,8 @@ def dm_infer_entry(
                 an_atoms = a_row.toatoms()
 
                 current_mol_charge = a_row.data.get("charge", mol_charge)
-                current_mol_dielectric_constant = a_row.data.dielectric_constant_weighted_detail.get('dielectric_constant_weighted', 0)
+                current_mol_dielectric_constant = a_row.data.dielectric_constant_weighted_detail.get(
+                    'dielectric_constant_weighted', 0)
 
                 print(f"[{idx}] charge = {current_mol_charge}")
                 print(f"[{idx}] dielectric_constant (eps) = {current_mol_dielectric_constant}")
@@ -566,21 +564,22 @@ def dm_infer_entry(
                     pred_dm = matrix_transform(pred_dm, atom_nums, convention=back_convention)
 
                 # ----------------------------
-                # D) Shared mf (within this item)
+                # D) Decoupled mean-fields (Gas for shapes, PCM for energies)
                 # ----------------------------
-                # IMPORTANT: eps is "pre-made" in db; we inject it here and print it.
-                mf_shared = dft.RKS(mol)
-                mf_shared.xc = "b3lyp"
+                mf_gas = dft.RKS(mol)
+                mf_gas.xc = "b3lyp"
 
+                mf_pcm = dft.RKS(mol)
+                mf_pcm.xc = "b3lyp"
                 eps = current_mol_dielectric_constant
                 if eps is not None and float(eps) > 1.0:
-                    mf_shared = mf_shared.PCM()
-                    mf_shared.with_solvent.eps = float(eps)
-                    mf_shared.with_solvent.method = "IEF-PCM"
+                    mf_pcm = mf_pcm.PCM()
+                    mf_pcm.with_solvent.eps = float(eps)
+                    mf_pcm.with_solvent.method = "IEF-PCM"
                     if build_uff_radii_table is not None:
-                        uff_radii_tb = build_uff_radii_table()  # Bohr
-                        mf_shared.with_solvent.radii_table = 1.1 * uff_radii_tb
-                    mf_shared.with_solvent.lebedev_order = 31
+                        uff_radii_tb = build_uff_radii_table()
+                        mf_pcm.with_solvent.radii_table = 1.1 * uff_radii_tb
+                    mf_pcm.with_solvent.lebedev_order = 31
 
                 # ----------------------------
                 # E) Basic properties
@@ -591,11 +590,10 @@ def dm_infer_entry(
                     "spin": int(mol_spin),
                 }
 
-                dip_vec = get_dipole_info(mol, pred_dm)  # Debye vector
+                dip_vec = get_dipole_info(mol, pred_dm)  # Debye vector (shape property)
                 props["dipole_vector"] = dip_vec
                 props["dipole_magnitude"] = float(np.linalg.norm(np.array(dip_vec)))
 
-                # Electron number check
                 Ne_pred = get_electron_number_from_dm(pred_dm, overlap)
                 charge_from_dm_infer = Zsum - Ne_pred
 
@@ -604,38 +602,36 @@ def dm_infer_entry(
                 props["Ne_error"] = float(abs(Ne_pred - total_electrons))
                 props["charge_from_dm_infer"] = float(charge_from_dm_infer)
 
-                print(
-                    f"[{idx}] Zsum={Zsum}  "
-                    f"expected Ne={Zsum - current_mol_charge:.6f}  Ne_pred={Ne_pred:.6f}  "
-                    f" Charge(db)={current_mol_charge}  Charge_from_dm_infer={charge_from_dm_infer:.6f}"
-                )
-
                 # ----------------------------
-                # F) Electronic structure (reuses mf_shared)
+                # F) Electronic structure (Decoupled extraction)
                 # ----------------------------
-                electronic_info = None
+                electronic_info_gas = None
                 if calc_electronic_flag:
-                    electronic_info = get_electronic_properties(
-                        mol,
-                        dm=pred_dm,
-                        overlap=overlap,
-                        mf=mf_shared,  # reuse
+                    # 1. Unperturbed (Gas) for physical shapes & coefficients
+                    electronic_info_gas = get_electronic_properties(
+                        mol, dm=pred_dm, overlap=overlap, mf=mf_gas
                     )
 
-                    props["HOMO"] = float(electronic_info["HOMO"] * Hartree)
-                    props["LUMO"] = float(electronic_info["LUMO"] * Hartree)
-                    props["GAP"] = float(electronic_info["GAP"] * Hartree)
+                    # 2. Perturbed (PCM) for energy values only
+                    electronic_info_pcm = get_electronic_properties(
+                        mol, dm=pred_dm, overlap=overlap, pcm_eps=float(eps) if eps else None, mf=mf_pcm
+                    )
 
-                    # Cubes
+                    props["HOMO"] = float(electronic_info_pcm["HOMO"] * Hartree)
+                    props["LUMO"] = float(electronic_info_pcm["LUMO"] * Hartree)
+                    props["GAP"] = float(electronic_info_pcm["GAP"] * Hartree)
+
+                    # Cubes (Must use GAS to avoid unphysical shape distortions)
                     if save_cube_info and idx < n_save_cube_items:
-                        homo_coeff = electronic_info["HOMO_coefficients"]
-                        lumo_coeff = electronic_info["LUMO_coefficients"]
+                        homo_coeff = electronic_info_gas["HOMO_coefficients"]
+                        lumo_coeff = electronic_info_gas["LUMO_coefficients"]
                         tools.cubegen.orbital(mol, "homo.cube", homo_coeff, nx=cube_grid, ny=cube_grid, nz=cube_grid)
                         tools.cubegen.orbital(mol, "lumo.cube", lumo_coeff, nx=cube_grid, ny=cube_grid, nz=cube_grid)
-                        tools.cubegen.density(mol, "pred_density.cube", pred_dm, nx=cube_grid, ny=cube_grid, nz=cube_grid)
+                        tools.cubegen.density(mol, "pred_density.cube", pred_dm, nx=cube_grid, ny=cube_grid,
+                                              nz=cube_grid)
 
                 # ----------------------------
-                # G) ESP / deformation (reuses mf_shared + fock/mo info if available)
+                # G) ESP / deformation (Requires GAS mf and shapes!)
                 # ----------------------------
                 if calc_esp_flag:
                     kwargs = dict(
@@ -643,17 +639,16 @@ def dm_infer_entry(
                         dm=pred_dm,
                         prefix="infer",
                         gen_dm_flag=gen_esp_cube_flag,
-                        mf=mf_shared,         # reuse shared mf
-                        overlap=overlap,      # reuse overlap
+                        mf=mf_gas,  # MUST BE unperturbed mf
+                        overlap=overlap,
                     )
 
-                    # If we already computed electronic_info, reuse fock/mo_* to avoid extra eig/get_fock
-                    if electronic_info is not None:
+                    if electronic_info_gas is not None:
                         kwargs.update(
-                            fock=electronic_info.get("hamiltonian", None),
-                            mo_energy=electronic_info.get("mo_energy", None),
-                            mo_coeff=electronic_info.get("mo_coeff", None),
-                            mo_occ=electronic_info.get("mo_occ", None),
+                            fock=electronic_info_gas.get("hamiltonian", None),
+                            mo_energy=electronic_info_gas.get("mo_energy", None),
+                            mo_coeff=electronic_info_gas.get("mo_coeff", None),  # MUST BE unperturbed shapes
+                            mo_occ=electronic_info_gas.get("mo_occ", None),
                         )
 
                     esp_max, esp_min, phi = calculate_properties_from_dm(**kwargs)
@@ -669,8 +664,7 @@ def dm_infer_entry(
 
                 summary_data_list.append(props)
 
-                # Keep pickle functionality (optional)
-                if save_cube_info and idx < n_save_cube_items and electronic_info is not None:
+                if save_cube_info and idx < n_save_cube_items and electronic_info_gas is not None:
                     mol_info = {
                         "atom_nums": [int(x) for x in atom_nums],
                         "atom_coords": [list(at.position) for at in an_atoms],
@@ -683,7 +677,7 @@ def dm_infer_entry(
                         {
                             "idx": idx,
                             "mol_info": mol_info,
-                            "outputs": electronic_info,
+                            "outputs": electronic_info_gas,  # Save gas info for accurate visuals
                             "tgt_info": None,
                         }
                     )
@@ -695,9 +689,6 @@ def dm_infer_entry(
             finally:
                 os.chdir(cwd_)
 
-    # ----------------------------
-    # Post loop: save pickle + npz
-    # ----------------------------
     if save_cube_info and temp_cube_file and len(temp_cube_data) > 0:
         save_path = os.path.join(results_folder_path, temp_cube_file)
         try:
