@@ -76,6 +76,7 @@ def ase_db_2_dummy_dptb_lmdb(ase_db_path: str, dptb_lmdb_path: str):
                 _keys.POSITIONS_KEY: an_atoms.positions.reshape(1, -1, 3).astype(np.float32),
                 _keys.CELL_KEY: an_atoms.cell.reshape(1, 3, 3).astype(np.float32),
                 "charge": a_row.data.get('charge', 0),
+                "dielectric_constant": a_row.data.dielectric_constant_weighted_detail.get('dielectric_constant_weighted', 0),
                 "idx": idx,
                 "nf": 0
             }
@@ -164,7 +165,11 @@ def dptb_infer_from_ase_db(ase_db_path: str, out_path: str,
         "get_Hamiltonian": False,
         "get_overlap": False
     }
-    reference_datasets = build_dataset(basis=basis, r_max=r_max, train_w_charge=True, **reference_info)
+    reference_datasets = build_dataset(basis=basis,
+                                       r_max=r_max,
+                                       train_w_charge=True,
+                                       train_w_eps=True,
+                                       **reference_info)
     reference_loader = DataLoader(dataset=reference_datasets, batch_size=1, shuffle=False)
 
     start_time = time.time()
@@ -437,7 +442,6 @@ def get_ham_info_from_npy(ase_db_path,
 # ==========================================
 # New Pure Inference Entry (DM -> Properties)
 # ==========================================
-
 def dm_infer_entry(
         abs_ase_path,
         results_folder_path,
@@ -449,7 +453,7 @@ def dm_infer_entry(
         calc_electronic_flag=True,
         save_cube_info=True,
         n_save_cube_items=5,
-        cube_grid=75,  # [New] Grid resolution for cube generation
+        cube_grid=75,  # Grid resolution for cube generation
         temp_cube_file="infer_cube_data.pkl",
         summary_filename="inference_summary.npz",
         gen_esp_cube_flag: bool = False,
@@ -459,8 +463,24 @@ def dm_infer_entry(
     Pure inference entry point.
     Loads geometry and predicted DM, calculates properties (Dipole, HOMO/LUMO, ESP),
     and saves results without calculating loss/metrics against a ground truth.
+
+    Refactor:
+    - Reuse a shared PySCF mf object within each item (electronic + ESP share the same mf/fock/ovlp/mo_*).
+    - dielectric_constant from db is treated as pre-made eps; mf is initialized with this eps and printed.
     """
-    # 1. Setup Convention
+    import os
+    import time
+    import json
+    import pickle
+    import traceback
+    import numpy as np
+    import pyscf
+    from pyscf import dft, tools
+    from ase.db import connect
+    from tqdm import tqdm
+    from ase.units import Hartree
+
+    # ---- Convention / basis ----
     if convention == "6311gdp":
         basis = "6-311+g(d,p)"
         back_convention = "back_2_thu_pyscf"
@@ -468,159 +488,188 @@ def dm_infer_entry(
         basis = "def2svp"
         back_convention = "back2pyscf"
 
+    results_folder_path = os.path.abspath(results_folder_path)
+
+    def _as_jsonable(x):
+        if isinstance(x, (np.ndarray, np.generic)):
+            return x.tolist()
+        return x
+
+
+    # Import here to keep function self-contained/replaceable
+    # build_uff_radii_table lives in emoles.loss module (your loss file)
+    try:
+        from emoles.loss import build_uff_radii_table
+    except Exception:
+        build_uff_radii_table = None
+
     start_time = time.time()
     summary_data_list = []
     temp_cube_data = []
 
-    count = 0
-    fail_count = 0
+    processed = 0
+    failed = 0
 
-    # Ensure results_folder_path is absolute
-    results_folder_path = os.path.abspath(results_folder_path)
-
-    # 2. Iterate Database
     with connect(abs_ase_path) as db:
-        # Determine total for tqdm
         total_rows = db.count() if max_items is None else max_items
 
         for idx, a_row in tqdm(enumerate(db.select()), total=total_rows):
             if max_items is not None and idx >= max_items:
                 break
 
-            cwd_ = os.getcwd()
             work_dir = os.path.join(results_folder_path, f"{idx}")
-
-            # Skip if directory doesn't exist
             if not os.path.exists(work_dir):
                 continue
 
+            cwd_ = os.getcwd()
             try:
                 os.chdir(work_dir)
-                count += 1
+                processed += 1
 
-                # --- A. Geometry & Mole Setup ---
+                # ----------------------------
+                # A) Geometry, charge, eps
+                # ----------------------------
                 atom_nums = a_row.numbers
                 an_atoms = a_row.toatoms()
 
-                # Load charge from DB or default
                 current_mol_charge = a_row.data.get("charge", mol_charge)
-                print(f'current_mol_charge: {current_mol_charge}')
+                current_mol_dielectric_constant = a_row.data.dielectric_constant_weighted_detail.get('dielectric_constant_weighted', 0)
 
-                sum_of_atomic_numbers = an_atoms.get_atomic_numbers().sum()
-                total_electrons = sum_of_atomic_numbers - current_mol_charge
+                print(f"[{idx}] charge = {current_mol_charge}")
+                print(f"[{idx}] dielectric_constant (eps) = {current_mol_dielectric_constant}")
+
+                Zsum = int(an_atoms.get_atomic_numbers().sum())
+                total_electrons = Zsum - current_mol_charge
                 mol_spin = total_electrons % 2
 
+                # ----------------------------
+                # B) Build PySCF molecule
+                # ----------------------------
                 mol = pyscf.gto.Mole()
-                t = [
-                    [atom_nums[atom_idx], an_atom.position]
-                    for atom_idx, an_atom in enumerate(an_atoms)
-                ]
                 mol.charge = current_mol_charge
                 mol.spin = mol_spin
-                mol.build(verbose=0, atom=t, basis=basis, unit="ang")
+                mol.build(
+                    verbose=0,
+                    atom=[[atom_nums[i], at.position] for i, at in enumerate(an_atoms)],
+                    basis=basis,
+                    unit="ang",
+                )
+                overlap = mol.intor("int1e_ovlp")
 
-                # --- B. Load Density Matrix ---
-                # Check if dm_filename is a full path or relative
-                if not os.path.isabs(dm_filename):
-                    # Usually just "predicted_dm.npy" in the current dir
-                    load_path = dm_filename
-                else:
-                    load_path = dm_filename
-
+                # ----------------------------
+                # C) Load DM (+ transform)
+                # ----------------------------
+                load_path = dm_filename if not os.path.isabs(dm_filename) else dm_filename
                 pred_dm = _load_npy_safe(load_path)
 
                 if transform_dm_flag:
                     pred_dm = matrix_transform(pred_dm, atom_nums, convention=back_convention)
 
-                # Dictionary to store inferred physical properties
+                # ----------------------------
+                # D) Shared mf (within this item)
+                # ----------------------------
+                # IMPORTANT: eps is "pre-made" in db; we inject it here and print it.
+                mf_shared = dft.RKS(mol)
+                mf_shared.xc = "b3lyp"
+
+                eps = current_mol_dielectric_constant
+                if eps is not None and float(eps) > 1.0:
+                    mf_shared = mf_shared.PCM()
+                    mf_shared.with_solvent.eps = float(eps)
+                    mf_shared.with_solvent.method = "IEF-PCM"
+                    if build_uff_radii_table is not None:
+                        uff_radii_tb = build_uff_radii_table()  # Bohr
+                        mf_shared.with_solvent.radii_table = 1.1 * uff_radii_tb
+                    mf_shared.with_solvent.lebedev_order = 31
+
+                # ----------------------------
+                # E) Basic properties
+                # ----------------------------
                 props = {
                     "idx": idx,
-                    "charge": current_mol_charge,
-                    "spin": mol_spin
+                    "charge": int(current_mol_charge),
+                    "spin": int(mol_spin),
                 }
 
-                # --- C. Dipole Moment ---
-                # Imported from emoles.pyscf
-                dip_vec = get_dipole_info(mol, pred_dm)  # Returns Debye vector
+                dip_vec = get_dipole_info(mol, pred_dm)  # Debye vector
                 props["dipole_vector"] = dip_vec
-                props["dipole_magnitude"] = np.linalg.norm(dip_vec)
+                props["dipole_magnitude"] = float(np.linalg.norm(np.array(dip_vec)))
 
-                # --- D. Electronic Structure (HOMO/LUMO/Gap/Electrons) ---
-                overlap = mol.intor("int1e_ovlp")
-
-                # Check electron number conservation (Imported from emoles.loss)
-                ne_pred = get_electron_number_from_dm(pred_dm, overlap)
-                props["Ne_actual"] = float(total_electrons)
-                props["Ne_pred"] = ne_pred
-                props["Ne_error"] = abs(ne_pred - total_electrons)
-
-                ##################
-                Zsum = int(an_atoms.get_atomic_numbers().sum())
+                # Electron number check
                 Ne_pred = get_electron_number_from_dm(pred_dm, overlap)
-                charge_from_dm_infer = Zsum - Ne_pred  # DM 隐含出来的“电荷”(化学定义)
+                charge_from_dm_infer = Zsum - Ne_pred
 
-                print("Zsum", Zsum,
-                      "charge(db)", current_mol_charge,
-                      "expected Ne", Zsum - current_mol_charge,
-                      "Ne_pred", Ne_pred,
-                      "charge_from_dm_infer", charge_from_dm_infer)
-                ##################
+                props["Ne_actual"] = float(total_electrons)
+                props["Ne_pred"] = float(Ne_pred)
+                props["Ne_error"] = float(abs(Ne_pred - total_electrons))
+                props["charge_from_dm_infer"] = float(charge_from_dm_infer)
 
+                print(
+                    f"[{idx}] Zsum={Zsum}  "
+                    f"expected Ne={Zsum - current_mol_charge:.6f}  Ne_pred={Ne_pred:.6f}  "
+                    f" Charge(db)={current_mol_charge}  Charge_from_dm_infer={charge_from_dm_infer:.6f}"
+                )
+
+                # ----------------------------
+                # F) Electronic structure (reuses mf_shared)
+                # ----------------------------
                 electronic_info = None
                 if calc_electronic_flag:
-                    # Uses imported get_electronic_properties from emoles.loss
-                    # Derives Hamiltonian from DM via PySCF to solve for energies
                     electronic_info = get_electronic_properties(
-                        mol, dm=pred_dm, overlap=overlap
+                        mol,
+                        dm=pred_dm,
+                        overlap=overlap,
+                        mf=mf_shared,  # reuse
                     )
 
-                    # Convert Hartree to eV for summary
                     props["HOMO"] = float(electronic_info["HOMO"] * Hartree)
                     props["LUMO"] = float(electronic_info["LUMO"] * Hartree)
                     props["GAP"] = float(electronic_info["GAP"] * Hartree)
 
-                    # [New Logic] Generate HOMO/LUMO Cubes locally
+                    # Cubes
                     if save_cube_info and idx < n_save_cube_items:
                         homo_coeff = electronic_info["HOMO_coefficients"]
                         lumo_coeff = electronic_info["LUMO_coefficients"]
+                        tools.cubegen.orbital(mol, "homo.cube", homo_coeff, nx=cube_grid, ny=cube_grid, nz=cube_grid)
+                        tools.cubegen.orbital(mol, "lumo.cube", lumo_coeff, nx=cube_grid, ny=cube_grid, nz=cube_grid)
+                        tools.cubegen.density(mol, "pred_density.cube", pred_dm, nx=cube_grid, ny=cube_grid, nz=cube_grid)
 
-                        # Generate orbital cubes
-                        tools.cubegen.orbital(mol, 'homo.cube', homo_coeff, nx=cube_grid, ny=cube_grid, nz=cube_grid)
-                        tools.cubegen.orbital(mol, 'lumo.cube', lumo_coeff, nx=cube_grid, ny=cube_grid, nz=cube_grid)
-
-                        # Optional: Also generate density cube since we have the DM
-                        tools.cubegen.density(mol, 'pred_density.cube', pred_dm, nx=cube_grid, ny=cube_grid,
-                                              nz=cube_grid)
-
-                # --- E. ESP & Deformation ---
+                # ----------------------------
+                # G) ESP / deformation (reuses mf_shared + fock/mo info if available)
+                # ----------------------------
                 if calc_esp_flag:
-                    # Imported from emoles.loss (wraps Multiwfn/Mokit)
-                    # prefix="infer" creates infer.fch
-                    esp_max, esp_min, phi = calculate_properties_from_dm(
-                        mol, pred_dm, prefix="infer", gen_dm_flag=gen_esp_cube_flag
+                    kwargs = dict(
+                        mol=mol,
+                        dm=pred_dm,
+                        prefix="infer",
+                        gen_dm_flag=gen_esp_cube_flag,
+                        mf=mf_shared,         # reuse shared mf
+                        overlap=overlap,      # reuse overlap
                     )
-                    props["ESP_max_eV"] = esp_max
-                    props["ESP_min_eV"] = esp_min
-                    props["Deformation_phi"] = phi
 
-                # --- F. Save Results ---
+                    # If we already computed electronic_info, reuse fock/mo_* to avoid extra eig/get_fock
+                    if electronic_info is not None:
+                        kwargs.update(
+                            fock=electronic_info.get("hamiltonian", None),
+                            mo_energy=electronic_info.get("mo_energy", None),
+                            mo_coeff=electronic_info.get("mo_coeff", None),
+                            mo_occ=electronic_info.get("mo_occ", None),
+                        )
 
-                # 1. Individual JSON
-                json_props = {}
-                for k, v in props.items():
-                    if isinstance(v, (np.ndarray, np.generic)):
-                        json_props[k] = v.tolist()
-                    else:
-                        json_props[k] = v
+                    esp_max, esp_min, phi = calculate_properties_from_dm(**kwargs)
+                    props["ESP_max_eV"] = float(esp_max)
+                    props["ESP_min_eV"] = float(esp_min)
+                    props["Deformation_phi"] = None if phi is None else float(phi)
 
+                # ----------------------------
+                # H) Save per-item json
+                # ----------------------------
                 with open("dm_inference_result.json", "w") as f_json:
-                    json.dump(json_props, f_json, indent=4)
+                    json.dump({k: _as_jsonable(v) for k, v in props.items()}, f_json, indent=4)
 
-                # 2. Add to summary list
                 summary_data_list.append(props)
 
-                # 3. Cube Info (Optional - for bulk generation later via pickle)
-                # Keep this if you still want the pickle functionality alongside direct generation
+                # Keep pickle functionality (optional)
                 if save_cube_info and idx < n_save_cube_items and electronic_info is not None:
                     mol_info = {
                         "atom_nums": [int(x) for x in atom_nums],
@@ -630,24 +679,25 @@ def dm_infer_entry(
                         "basis": basis,
                         "unit": "ang",
                     }
-                    cube_item = {
-                        "idx": idx,
-                        "mol_info": mol_info,
-                        "outputs": electronic_info,  # Contains coeffs and occ
-                        "tgt_info": None
-                    }
-                    temp_cube_data.append(cube_item)
+                    temp_cube_data.append(
+                        {
+                            "idx": idx,
+                            "mol_info": mol_info,
+                            "outputs": electronic_info,
+                            "tgt_info": None,
+                        }
+                    )
 
             except Exception as e:
-                fail_count += 1
+                failed += 1
                 traceback.print_exc()
                 print(f"[dm_infer_entry] idx {idx} failed: {repr(e)}")
             finally:
                 os.chdir(cwd_)
 
-    # 3. Post-Loop Saving
-
-    # Save Cube Pickle (contains wavefunctions for plotting)
+    # ----------------------------
+    # Post loop: save pickle + npz
+    # ----------------------------
     if save_cube_info and temp_cube_file and len(temp_cube_data) > 0:
         save_path = os.path.join(results_folder_path, temp_cube_file)
         try:
@@ -657,34 +707,31 @@ def dm_infer_entry(
         except Exception as e:
             print(f"[dm_infer_entry] Failed to save cube data: {e}")
 
-    # Save Summary NPZ
     if len(summary_data_list) > 0:
         all_keys = set().union(*(d.keys() for d in summary_data_list))
         npz_dict = {}
         for key in all_keys:
             values = []
             for item in summary_data_list:
-                val = item.get(key, np.nan)
-                if isinstance(val, (list, np.ndarray)):
-                    values.append(val)
-                elif val is None:
+                v = item.get(key, np.nan)
+                if isinstance(v, (list, np.ndarray)):
+                    values.append(v)
+                elif v is None:
                     values.append(np.nan)
                 else:
-                    values.append(val)
-
+                    values.append(v)
             try:
                 npz_dict[key] = np.array(values)
-            except:
+            except Exception:
                 npz_dict[key] = np.array(values, dtype=object)
 
         np.savez(os.path.join(results_folder_path, summary_filename), **npz_dict)
         print(f"[dm_infer_entry] Summary saved to {summary_filename}")
 
-    end_time = time.time()
-    total_time = end_time - start_time
-    avg_time = total_time / max(1, count)
+    total_time = time.time() - start_time
+    avg_time = total_time / max(1, processed)
 
-    print(f"[dm_infer_entry] Finished. Processed: {count}, Failed: {fail_count}")
+    print(f"[dm_infer_entry] Finished. Processed: {processed}, Failed: {failed}")
     print(f"Total Time: {total_time:.2f}s, Avg: {avg_time:.4f}s/item")
 
     return summary_data_list
