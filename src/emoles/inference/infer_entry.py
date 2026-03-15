@@ -142,6 +142,7 @@ def dptb_infer_from_ase_db(ase_db_path: str, out_path: str,
     model = build_model(checkpoint=checkpoint_path)
     model.to(device)
     basis, r_max = extract_model_params(model)
+    print(r_max)
     abs_out_path = os.path.abspath(out_path)
     ase_db_path = os.path.abspath(ase_db_path)
 
@@ -458,6 +459,7 @@ def dm_infer_entry(
         summary_filename="inference_summary.npz",
         gen_esp_cube_flag: bool = False,
         max_items=None,
+        unified_pcm_flag: bool = True,  # 新增 flag: 默认开启，统一使用 PCM，不再分离 gas 和 pcm
 ):
     """
     Pure inference entry point.
@@ -566,9 +568,6 @@ def dm_infer_entry(
                 # ----------------------------
                 # D) Decoupled mean-fields (Gas for shapes, PCM for energies)
                 # ----------------------------
-                mf_gas = dft.RKS(mol)
-                mf_gas.xc = "b3lyp"
-
                 mf_pcm = dft.RKS(mol)
                 mf_pcm.xc = "b3lyp"
                 eps = current_mol_dielectric_constant
@@ -580,6 +579,13 @@ def dm_infer_entry(
                         uff_radii_tb = build_uff_radii_table()
                         mf_pcm.with_solvent.radii_table = 1.1 * uff_radii_tb
                     mf_pcm.with_solvent.lebedev_order = 31
+
+                # 最小侵入式修改：根据 flag 决定是否分离 gas 实例
+                if unified_pcm_flag:
+                    mf_gas = mf_pcm
+                else:
+                    mf_gas = dft.RKS(mol)
+                    mf_gas.xc = "b3lyp"
 
                 # ----------------------------
                 # E) Basic properties
@@ -607,21 +613,24 @@ def dm_infer_entry(
                 # ----------------------------
                 electronic_info_gas = None
                 if calc_electronic_flag:
-                    # 1. Unperturbed (Gas) for physical shapes & coefficients
-                    electronic_info_gas = get_electronic_properties(
-                        mol, dm=pred_dm, overlap=overlap, mf=mf_gas
-                    )
-
-                    # 2. Perturbed (PCM) for energy values only
+                    # 总是需要计算 PCM 作为主 reference 用于 energy values
                     electronic_info_pcm = get_electronic_properties(
                         mol, dm=pred_dm, overlap=overlap, pcm_eps=float(eps) if eps else None, mf=mf_pcm
                     )
+
+                    if unified_pcm_flag:
+                        electronic_info_gas = electronic_info_pcm
+                    else:
+                        # Unperturbed (Gas) for physical shapes & coefficients
+                        electronic_info_gas = get_electronic_properties(
+                            mol, dm=pred_dm, overlap=overlap, mf=mf_gas
+                        )
 
                     props["HOMO"] = float(electronic_info_pcm["HOMO"] * Hartree)
                     props["LUMO"] = float(electronic_info_pcm["LUMO"] * Hartree)
                     props["GAP"] = float(electronic_info_pcm["GAP"] * Hartree)
 
-                    # Cubes (Must use GAS to avoid unphysical shape distortions)
+                    # Cubes
                     if save_cube_info and idx < n_save_cube_items:
                         homo_coeff = electronic_info_gas["HOMO_coefficients"]
                         lumo_coeff = electronic_info_gas["LUMO_coefficients"]
@@ -639,7 +648,7 @@ def dm_infer_entry(
                         dm=pred_dm,
                         prefix="infer",
                         gen_dm_flag=gen_esp_cube_flag,
-                        mf=mf_gas,  # MUST BE unperturbed mf
+                        mf=mf_gas,  # 如果 flag 为 True，此处天然变成统一的 mf_pcm
                         overlap=overlap,
                     )
 
@@ -647,7 +656,7 @@ def dm_infer_entry(
                         kwargs.update(
                             fock=electronic_info_gas.get("hamiltonian", None),
                             mo_energy=electronic_info_gas.get("mo_energy", None),
-                            mo_coeff=electronic_info_gas.get("mo_coeff", None),  # MUST BE unperturbed shapes
+                            mo_coeff=electronic_info_gas.get("mo_coeff", None),
                             mo_occ=electronic_info_gas.get("mo_occ", None),
                         )
 
@@ -677,7 +686,7 @@ def dm_infer_entry(
                         {
                             "idx": idx,
                             "mol_info": mol_info,
-                            "outputs": electronic_info_gas,  # Save gas info for accurate visuals
+                            "outputs": electronic_info_gas,  # unified下为pcm结果，否则为gas结果
                             "tgt_info": None,
                         }
                     )
