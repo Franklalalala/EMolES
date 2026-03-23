@@ -443,6 +443,39 @@ def get_ham_info_from_npy(ase_db_path,
 # ==========================================
 # New Pure Inference Entry (DM -> Properties)
 # ==========================================
+# ==========================================
+# New Pure Inference Entry (DM -> Properties)
+# ==========================================
+
+def _calc_energy_and_properties(mol, dm, overlap, mf, pcm_eps=None):
+    """
+    [Helper] Efficiently calculate total energy and electronic properties.
+    Extracts h1e and veff ONCE, reusing them for both Energy and Fock matrix
+    assembly to strictly avoid duplicate heavy 2e-integrals.
+    """
+    from ase.units import Hartree
+
+    # 1. Evaluate core Hamiltonian and effective potential (Heavy computation happens here)
+    h1e = mf.get_hcore()
+    veff = mf.get_veff(mol, dm)
+
+    # 2. Assemble Fock matrix and Total Energy reusing h1e and veff (Millisecond level)
+    fock = mf.get_fock(h1e=h1e, vhf=veff, dm=dm)
+    tot_energy_hartree = mf.energy_tot(dm=dm, h1e=h1e, vhf=veff)
+
+    # 3. Extract PCM interaction energy if present
+    pcm_energy_hartree = 0.0
+    if hasattr(mf, 'with_solvent') and hasattr(mf.with_solvent, 'e'):
+        pcm_energy_hartree = getattr(mf.with_solvent, 'e')
+
+    # 4. Delegate to original function, passing explicit `ham=fock` to bypass internal get_fock
+    elec_info = get_electronic_properties(
+        mol, ham=fock, dm=dm, overlap=overlap, pcm_eps=pcm_eps, mf=mf
+    )
+
+    return elec_info, tot_energy_hartree, pcm_energy_hartree
+
+
 def dm_infer_entry(
         abs_ase_path,
         results_folder_path,
@@ -459,16 +492,12 @@ def dm_infer_entry(
         summary_filename="inference_summary.npz",
         gen_esp_cube_flag: bool = False,
         max_items=None,
-        unified_pcm_flag: bool = True,  # 新增 flag: 默认开启，统一使用 PCM，不再分离 gas 和 pcm
+        unified_pcm_flag: bool = True,  # 默认开启，统一使用 PCM
 ):
     """
     Pure inference entry point.
     Loads geometry and predicted DM, calculates properties (Dipole, HOMO/LUMO, ESP),
     and saves results without calculating loss/metrics against a ground truth.
-
-    Refactor:
-    - Reuse a shared PySCF mf object within each item (electronic + ESP share the same mf/fock/ovlp/mo_*).
-    - dielectric_constant from db is treated as pre-made eps; mf is initialized with this eps and printed.
     """
     import os
     import time
@@ -535,8 +564,7 @@ def dm_infer_entry(
                 current_mol_dielectric_constant = a_row.data.dielectric_constant_weighted_detail.get(
                     'dielectric_constant_weighted', 0)
 
-                print(f"[{idx}] charge = {current_mol_charge}")
-                print(f"[{idx}] dielectric_constant (eps) = {current_mol_dielectric_constant}")
+                print(f"[{idx}] charge = {current_mol_charge}, eps = {current_mol_dielectric_constant}")
 
                 Zsum = int(an_atoms.get_atomic_numbers().sum())
                 total_electrons = Zsum - current_mol_charge
@@ -566,7 +594,7 @@ def dm_infer_entry(
                     pred_dm = matrix_transform(pred_dm, atom_nums, convention=back_convention)
 
                 # ----------------------------
-                # D) Decoupled mean-fields (Gas for shapes, PCM for energies)
+                # D) Decoupled mean-fields
                 # ----------------------------
                 mf_pcm = dft.RKS(mol)
                 mf_pcm.xc = "b3lyp"
@@ -576,11 +604,9 @@ def dm_infer_entry(
                     mf_pcm.with_solvent.eps = float(eps)
                     mf_pcm.with_solvent.method = "IEF-PCM"
                     if build_uff_radii_table is not None:
-                        uff_radii_tb = build_uff_radii_table()
-                        mf_pcm.with_solvent.radii_table = 1.1 * uff_radii_tb
+                        mf_pcm.with_solvent.radii_table = 1.1 * build_uff_radii_table()
                     mf_pcm.with_solvent.lebedev_order = 31
 
-                # 最小侵入式修改：根据 flag 决定是否分离 gas 实例
                 if unified_pcm_flag:
                     mf_gas = mf_pcm
                 else:
@@ -596,62 +622,62 @@ def dm_infer_entry(
                     "spin": int(mol_spin),
                 }
 
-                dip_vec = get_dipole_info(mol, pred_dm)  # Debye vector (shape property)
+                dip_vec = get_dipole_info(mol, pred_dm)
                 props["dipole_vector"] = dip_vec
                 props["dipole_magnitude"] = float(np.linalg.norm(np.array(dip_vec)))
 
                 Ne_pred = get_electron_number_from_dm(pred_dm, overlap)
-                charge_from_dm_infer = Zsum - Ne_pred
-
                 props["Ne_actual"] = float(total_electrons)
                 props["Ne_pred"] = float(Ne_pred)
                 props["Ne_error"] = float(abs(Ne_pred - total_electrons))
-                props["charge_from_dm_infer"] = float(charge_from_dm_infer)
+                props["charge_from_dm_infer"] = float(Zsum - Ne_pred)
 
                 # ----------------------------
-                # F) Electronic structure (Decoupled extraction)
+                # F) Electronic structure (Cleaned & Optimized)
                 # ----------------------------
                 electronic_info_gas = None
                 if calc_electronic_flag:
-                    # 总是需要计算 PCM 作为主 reference 用于 energy values
-                    electronic_info_pcm = get_electronic_properties(
-                        mol, dm=pred_dm, overlap=overlap, pcm_eps=float(eps) if eps else None, mf=mf_pcm
+                    # 1. PCM Properties & Total Energies (For Ranking)
+                    elec_info_pcm, e_tot_pcm, e_pcm_int = _calc_energy_and_properties(
+                        mol, pred_dm, overlap, mf_pcm, float(eps) if eps else None
                     )
 
-                    if unified_pcm_flag:
-                        electronic_info_gas = electronic_info_pcm
-                    else:
-                        # Unperturbed (Gas) for physical shapes & coefficients
-                        electronic_info_gas = get_electronic_properties(
-                            mol, dm=pred_dm, overlap=overlap, mf=mf_gas
-                        )
+                    props["total_energy_Hartree"] = float(e_tot_pcm)
+                    props["total_energy_eV"] = float(e_tot_pcm * Hartree)
+                    if eps is not None and float(eps) > 1.0:
+                        props["pcm_interaction_energy_Hartree"] = float(e_pcm_int)
+                        props["pcm_interaction_energy_eV"] = float(e_pcm_int * Hartree)
 
-                    props["HOMO"] = float(electronic_info_pcm["HOMO"] * Hartree)
-                    props["LUMO"] = float(electronic_info_pcm["LUMO"] * Hartree)
-                    props["GAP"] = float(electronic_info_pcm["GAP"] * Hartree)
+                    props["HOMO"] = float(elec_info_pcm["HOMO"] * Hartree)
+                    props["LUMO"] = float(elec_info_pcm["LUMO"] * Hartree)
+                    props["GAP"] = float(elec_info_pcm["GAP"] * Hartree)
+
+                    # 2. Shape / Gas Properties (For Cubes/ESP)
+                    if unified_pcm_flag:
+                        electronic_info_gas = elec_info_pcm
+                    else:
+                        elec_info_gas, _, _ = _calc_energy_and_properties(
+                            mol, pred_dm, overlap, mf_gas, pcm_eps=None
+                        )
+                        electronic_info_gas = elec_info_gas
 
                     # Cubes
                     if save_cube_info and idx < n_save_cube_items:
-                        homo_coeff = electronic_info_gas["HOMO_coefficients"]
-                        lumo_coeff = electronic_info_gas["LUMO_coefficients"]
-                        tools.cubegen.orbital(mol, "homo.cube", homo_coeff, nx=cube_grid, ny=cube_grid, nz=cube_grid)
-                        tools.cubegen.orbital(mol, "lumo.cube", lumo_coeff, nx=cube_grid, ny=cube_grid, nz=cube_grid)
+                        tools.cubegen.orbital(mol, "homo.cube", electronic_info_gas["HOMO_coefficients"], nx=cube_grid,
+                                              ny=cube_grid, nz=cube_grid)
+                        tools.cubegen.orbital(mol, "lumo.cube", electronic_info_gas["LUMO_coefficients"], nx=cube_grid,
+                                              ny=cube_grid, nz=cube_grid)
                         tools.cubegen.density(mol, "pred_density.cube", pred_dm, nx=cube_grid, ny=cube_grid,
                                               nz=cube_grid)
 
                 # ----------------------------
-                # G) ESP / deformation (Requires GAS mf and shapes!)
+                # G) ESP / deformation
                 # ----------------------------
                 if calc_esp_flag:
                     kwargs = dict(
-                        mol=mol,
-                        dm=pred_dm,
-                        prefix="infer",
-                        gen_dm_flag=gen_esp_cube_flag,
-                        mf=mf_gas,  # 如果 flag 为 True，此处天然变成统一的 mf_pcm
-                        overlap=overlap,
+                        mol=mol, dm=pred_dm, prefix="infer", gen_dm_flag=gen_esp_cube_flag,
+                        mf=mf_gas, overlap=overlap,
                     )
-
                     if electronic_info_gas is not None:
                         kwargs.update(
                             fock=electronic_info_gas.get("hamiltonian", None),
@@ -675,20 +701,11 @@ def dm_infer_entry(
 
                 if save_cube_info and idx < n_save_cube_items and electronic_info_gas is not None:
                     mol_info = {
-                        "atom_nums": [int(x) for x in atom_nums],
-                        "atom_coords": [list(at.position) for at in an_atoms],
-                        "charge": int(current_mol_charge),
-                        "spin": int(mol_spin),
-                        "basis": basis,
-                        "unit": "ang",
+                        "atom_nums": [int(x) for x in atom_nums], "atom_coords": [list(at.position) for at in an_atoms],
+                        "charge": int(current_mol_charge), "spin": int(mol_spin), "basis": basis, "unit": "ang",
                     }
                     temp_cube_data.append(
-                        {
-                            "idx": idx,
-                            "mol_info": mol_info,
-                            "outputs": electronic_info_gas,  # unified下为pcm结果，否则为gas结果
-                            "tgt_info": None,
-                        }
+                        {"idx": idx, "mol_info": mol_info, "outputs": electronic_info_gas, "tgt_info": None}
                     )
 
             except Exception as e:
@@ -703,9 +720,8 @@ def dm_infer_entry(
         try:
             with open(save_path, "wb") as f:
                 pickle.dump(temp_cube_data, f)
-            print(f"[dm_infer_entry] Saved cube info for {len(temp_cube_data)} items to {save_path}")
         except Exception as e:
-            print(f"[dm_infer_entry] Failed to save cube data: {e}")
+            pass
 
     if len(summary_data_list) > 0:
         all_keys = set().union(*(d.keys() for d in summary_data_list))
@@ -729,9 +745,7 @@ def dm_infer_entry(
         print(f"[dm_infer_entry] Summary saved to {summary_filename}")
 
     total_time = time.time() - start_time
-    avg_time = total_time / max(1, processed)
-
     print(f"[dm_infer_entry] Finished. Processed: {processed}, Failed: {failed}")
-    print(f"Total Time: {total_time:.2f}s, Avg: {avg_time:.4f}s/item")
+    print(f"Total Time: {total_time:.2f}s, Avg: {total_time / max(1, processed):.4f}s/item")
 
     return summary_data_list
