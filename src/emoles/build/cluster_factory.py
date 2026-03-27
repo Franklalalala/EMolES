@@ -15,7 +15,7 @@ from ase.io import write
 from tqdm import tqdm
 
 from emoles.build.cluster import build_cluster
-from emoles.inference.common_tools import atom_2_smile
+from emoles.inference.common_tools import atom_2_smile, smile_to_inchi, smile_to_maccs_fp_arr, tanimoto_similarity
 
 try:
     import emoles.build.uma_entry as uma_entry
@@ -41,24 +41,6 @@ DEFAULT_FIXED_EPS = 28.29
 # ═══════════════════════════════════════════════════════════════════════════════
 # Small utilities
 # ═══════════════════════════════════════════════════════════════════════════════
-def smile_to_inchi(smile: str) -> str:
-    mol = Chem.MolFromSmiles(smile)
-    if mol is None:
-        raise ValueError(f"RDKit cannot parse SMILES: {smile}")
-    return Chem.MolToInchi(mol)
-
-
-def smile_to_maccs_fp_arr(smiles: str) -> np.ndarray:
-    mol = Chem.MolFromSmiles(smiles)
-    fingerprint = AllChem.GetMACCSKeysFingerprint(mol)
-    return np.array(list(fingerprint.ToBitString())).astype(int)
-
-
-def tanimoto_similarity(fp1: np.ndarray, fp2: np.ndarray) -> float:
-    a, b = fp1.astype(bool), fp2.astype(bool)
-    inter = np.logical_and(a, b).sum()
-    union = np.logical_or(a, b).sum()
-    return float(inter / union) if union else 0.0
 
 
 def sanitize_filename(filename: str, max_length: int = 30) -> str:

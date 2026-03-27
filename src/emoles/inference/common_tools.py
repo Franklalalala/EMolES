@@ -364,6 +364,26 @@ def atom_2_mol(an_atoms: ase.atoms.Atoms):
     return mol
 
 
+def smile_to_inchi(smile: str) -> str:
+    mol = Chem.MolFromSmiles(smile)
+    if mol is None:
+        raise ValueError(f"RDKit cannot parse SMILES: {smile}")
+    return Chem.MolToInchi(mol)
+
+
+def smile_to_maccs_fp_arr(smiles: str) -> np.ndarray:
+    mol = Chem.MolFromSmiles(smiles)
+    fingerprint = AllChem.GetMACCSKeysFingerprint(mol)
+    return np.array(list(fingerprint.ToBitString())).astype(int)
+
+
+def tanimoto_similarity(fp1: np.ndarray, fp2: np.ndarray) -> float:
+    a, b = fp1.astype(bool), fp2.astype(bool)
+    inter = np.logical_and(a, b).sum()
+    union = np.logical_or(a, b).sum()
+    return float(inter / union) if union else 0.0
+
+
 def atom_2_smile(an_atoms: ase.atoms.Atoms):
     a_mol = atom_2_mol(an_atoms)
     a_mol = Chem.RemoveHs(a_mol)
@@ -378,6 +398,54 @@ def smile_2_atom(smile: str, maxAttempts: int=1000000):
     AllChem.MMFFOptimizeMolecule(a_mol_with_H)
     an_atoms = mol_2_atom(mol=a_mol_with_H)
     return an_atoms
+
+
+def annotate_db_dc_by_similarity(q_db_path: str, ref_db_path: str):
+    """
+    独立的核心逻辑（针对单分子 DB）：
+    1. 预加载 ref_db 的 InChI 和 MACCS 指纹
+    2. 遍历 q_db，生成 SMILES 和 InChI
+    3. 优先精确匹配 InChI，否则降级使用指纹相似度匹配获取 DC
+    4. 更新 q_db
+    """
+
+    # 1. 预加载 Reference DB
+    ref_rows = []
+    inchi_map = {}
+    with connect(ref_db_path) as ref_db:
+        for row in ref_db.select():
+            inchi = getattr(row, "inchi", None)
+            dc = float(getattr(row, "dielectric_constant", 0.0))
+            fp = np.array(row.data["maccs_fp"]).astype(int)
+
+            ref_dict = {"dc": dc, "fp": fp}
+            ref_rows.append(ref_dict)
+            if inchi:
+                inchi_map[inchi] = ref_dict
+
+    # 2. 遍历并更新 Query DB
+    with connect(q_db_path) as q_db:
+        for row in tqdm(q_db.select(), desc="Annotating weighted DC"):
+            data = dict(row.data) if row.data else {}
+
+            # 获取分子的 SMILES 和 InChI（统一使用复数形式的 smiles 变量名）
+            an_atoms = row.toatoms()
+            smiles = atom_2_smile(an_atoms)
+            inchi = smile_to_inchi(smiles)
+
+            # 3. 匹配介电常数 (DC)
+            if inchi in inchi_map:
+                # 优先 InChI 精确匹配
+                matched_dc = inchi_map[inchi]["dc"]
+            else:
+                # 降级：指纹 Tanimoto 相似度最大值匹配
+                q_fp = smile_to_maccs_fp_arr(smiles)
+                best_match = max(ref_rows, key=lambda r: tanimoto_similarity(q_fp, r["fp"]))
+                matched_dc = best_match["dc"]
+
+            # 4. 更新 Query DB 数据库
+            data["dielectric_constant_weighted"] = matched_dc
+            q_db.update(row.id, dielectric_constant=matched_dc, data=data)
 
 
 def smile_2_db(smile_path: str, db_path: str, fail_smile_path: str,  maxAttempts: int=1000000):
