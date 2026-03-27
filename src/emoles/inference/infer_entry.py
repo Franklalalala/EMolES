@@ -76,7 +76,8 @@ def ase_db_2_dummy_dptb_lmdb(ase_db_path: str, dptb_lmdb_path: str):
                 _keys.POSITIONS_KEY: an_atoms.positions.reshape(1, -1, 3).astype(np.float32),
                 _keys.CELL_KEY: an_atoms.cell.reshape(1, 3, 3).astype(np.float32),
                 "charge": a_row.data.get('charge', 0),
-                "dielectric_constant": a_row.data.dielectric_constant_weighted_detail.get('dielectric_constant_weighted', 0),
+                "dielectric_constant": getattr(a_row, 'dielectric_constant', None) or a_row.data.get('dielectric_constant_weighted_detail',
+                                                                             {}).get('dielectric_constant_weighted', 0),
                 "idx": idx,
                 "nf": 0
             }
@@ -561,8 +562,8 @@ def dm_infer_entry(
                 an_atoms = a_row.toatoms()
 
                 current_mol_charge = a_row.data.get("charge", mol_charge)
-                current_mol_dielectric_constant = a_row.data.dielectric_constant_weighted_detail.get(
-                    'dielectric_constant_weighted', 0)
+                current_mol_dielectric_constant = getattr(a_row, 'dielectric_constant', None) or a_row.data.get('dielectric_constant_weighted_detail',
+                                                                             {}).get('dielectric_constant_weighted', 0)
 
                 print(f"[{idx}] charge = {current_mol_charge}, eps = {current_mol_dielectric_constant}")
 
