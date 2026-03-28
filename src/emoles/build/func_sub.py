@@ -13,12 +13,12 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from ase import Atoms
-from ase.build import molecule as ase_molecule
 from ase.data import covalent_radii
 from ase.db import connect
 from tqdm import tqdm
 
 from rdkit import Chem
+from rdkit.Chem import AllChem
 from rdkit.Chem.rdDetermineBonds import DetermineBonds
 from rdkit.rdBase import WrapLogs
 
@@ -26,25 +26,29 @@ from emoles.build.CombineMols3D import combine_2_mols_with_dummy
 
 
 # ============================================================
-# 0) Dynamic skin 配置（你要求：start=-0.5, step=0.1）
+# 0) Dynamic distance (基于被取代 H 的位置)
 # ============================================================
 @dataclass(frozen=True)
-class DynamicSkinConfig:
-    start: float = -0.5
+class DynamicDistanceConfig:
+    # offset in Å; bond_distance = d(anchor-H) + offset
+    offset_start: float = 0.0
     step: float = 0.1
 
-    # 在同一 skin 下尝试多少次“随机旋转再拼接”
-    rotations_per_skin: int = 5
+    # 同一 offset 下，尝试多少次随机旋转
+    rotations_per_offset: int = 6
 
-    # skin 自适应调整次数上限（总共尝试 = rotations_per_skin * max_adjust）
-    max_adjust: int = 10
+    # offset 调整次数上限
+    max_adjust: int = 12
 
-    # 允许的 skin 取值范围，避免无限跑飞
-    min_skin: float = -2.0
-    max_skin: float = 2.0
+    # offset 限制，防止跑飞
+    min_offset: float = -1.0
+    max_offset: float = 1.5
+
+    # 将 (r1+r2) 乘以一个系数再用于 skin 计算（一般保持 1.0）
+    radii_scale: float = 1.0
 
 
-DEFAULT_SKIN_CFG = DynamicSkinConfig()
+DEFAULT_DIST_CFG = DynamicDistanceConfig()
 
 
 # ============================================================
@@ -67,7 +71,7 @@ def _rdkit_silent():
 
 
 # ============================================================
-# 2) 纯内存：ASE Atoms -> smiles/inchi
+# 2) ASE Atoms -> smiles/inchi (MolFromXYZBlock + DetermineBonds)
 # ============================================================
 def atoms_to_xyz_block(atoms: Atoms) -> Optional[str]:
     syms = atoms.get_chemical_symbols()
@@ -99,7 +103,10 @@ def atoms_to_smiles_inchi_fast(atoms: Atoms) -> Tuple[Optional[str], Optional[st
             return None, None
 
 
-def atoms_to_smiles_inchi_fast_verbose(atoms: Atoms) -> Tuple[Optional[str], Optional[str], str]:
+def atoms_to_smiles_inchi_with_log(atoms: Atoms) -> Tuple[Optional[str], Optional[str], str]:
+    """
+    返回 smiles/inchi + RDKit stderr log，用于过滤“奇怪价态/重排”警告。
+    """
     xyz = atoms_to_xyz_block(atoms)
     if xyz is None:
         return None, None, "XYZ_BLOCK_FAIL(X present?)"
@@ -119,7 +126,7 @@ def atoms_to_smiles_inchi_fast_verbose(atoms: Atoms) -> Tuple[Optional[str], Opt
 
 
 # ============================================================
-# 3) 干净筛选器：几何/连通性 + SMILES 规则（禁 O–H）
+# 3) 筛选器：几何/连通性 + SMILES 规则（禁 O–H）
 # ============================================================
 @dataclass(frozen=True)
 class FilterConfig:
@@ -134,6 +141,9 @@ class FilterConfig:
     forbid_cc_triple: bool = True
     forbid_oo_bond: bool = True
     forbid_oh_bond: bool = True
+
+    # 过滤 RDKit 警告（避免怪价态/电荷重排）
+    reject_rdkit_warnings: bool = True
 
 
 def _pairwise_distances(pos: np.ndarray) -> np.ndarray:
@@ -224,14 +234,33 @@ def smiles_rule_filter(smiles: str, cfg: FilterConfig) -> Tuple[bool, str]:
         return False, "SMILES_RULE_FAIL"
 
 
+def _rdkit_warning_bad(log: str) -> bool:
+    if not log:
+        return False
+    bad_keys = [
+        "Charges were rearranged",
+        "Accepted unusual valence",
+        "Explicit valence for atom",
+        "KekulizeException",
+    ]
+    return any(k in log for k in bad_keys)
+
+
 def clean_filter_atoms(atoms: Atoms, cfg: FilterConfig) -> Tuple[bool, Optional[str], Optional[str], str]:
     ok, reason = topo_geometry_filter(atoms, cfg)
     if not ok:
         return False, None, None, reason
 
-    smiles, inchi = atoms_to_smiles_inchi_fast(atoms)
-    if smiles is None or inchi is None:
-        return False, None, None, "RDKit_FAIL"
+    if cfg.reject_rdkit_warnings:
+        smiles, inchi, log = atoms_to_smiles_inchi_with_log(atoms)
+        if smiles is None or inchi is None:
+            return False, None, None, "RDKit_FAIL"
+        if _rdkit_warning_bad(log):
+            return False, None, None, "RDKit_WARN_VALENCE"
+    else:
+        smiles, inchi = atoms_to_smiles_inchi_fast(atoms)
+        if smiles is None or inchi is None:
+            return False, None, None, "RDKit_FAIL"
 
     ok2, reason2 = smiles_rule_filter(smiles, cfg)
     if not ok2:
@@ -241,113 +270,117 @@ def clean_filter_atoms(atoms: Atoms, cfg: FilterConfig) -> Tuple[bool, Optional[
 
 
 # ============================================================
-# 4) 片段库（dummy = X）
-#    注意：frag_lib 不再携带 skin；skin 由 dynamic skin 在 combine 时动态传入
+# 4) 片段库：用 RDKit 可靠 SMILES -> 3D -> 优化 -> 替换 placeholder 为 X
 # ============================================================
 @dataclass(frozen=True)
 class FragEntry:
     atoms: Atoms
-    dummy2_idx: int
+    dummy2_idx: int   # X 原子
+    attach_idx: int   # 与 X 相连的那个原子（用于半径/距离计算）
 
 
-def frag_CH3() -> FragEntry:
-    m = ase_molecule("CH4")
-    dummy2_idx = 4
-    m.symbols[dummy2_idx] = "X"
-    return FragEntry(m, dummy2_idx)
+def _rdkit_mol_3d(smiles: str, seed: int = 0) -> Chem.Mol:
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"bad smiles: {smiles}")
+    mol = Chem.AddHs(mol)
 
+    params = AllChem.ETKDGv3()
+    params.randomSeed = int(seed)
+    params.useSmallRingTorsions = True
+    params.useExpTorsionAnglePrefs = True
 
-def frag_F() -> FragEntry:
-    m = Atoms("FX", positions=[[0, 0, 0], [1.0, 0, 0]])
-    return FragEntry(m, 1)
+    code = AllChem.EmbedMolecule(mol, params)
+    if code != 0:
+        # 退一步
+        code = AllChem.EmbedMolecule(mol, randomSeed=int(seed))
+        if code != 0:
+            raise RuntimeError(f"RDKit Embed failed for: {smiles}")
 
-
-def frag_CF3() -> FragEntry:
+    # 优先 MMFF，其次 UFF；失败就算了（至少有 3D）
     try:
-        m = ase_molecule("CHF3")
-        h_idx = [a.index for a in m if a.symbol == "H"][0]
-        m.symbols[h_idx] = "X"
-        return FragEntry(m, h_idx)
+        if AllChem.MMFFHasAllMoleculeParams(mol):
+            AllChem.MMFFOptimizeMolecule(mol, maxIters=300)
+        else:
+            AllChem.UFFOptimizeMolecule(mol, maxIters=300)
     except Exception:
-        m = Atoms(
-            "CFFFH",
-            positions=[
-                [0.000, 0.000, 0.000],
-                [1.330, 0.000, 0.000],
-                [-0.665, 1.152, 0.000],
-                [-0.665, -1.152, 0.000],
-                [0.000, 0.000, 1.090],
-            ],
-        )
-        dummy2_idx = 4
-        m.symbols[dummy2_idx] = "X"
-        return FragEntry(m, dummy2_idx)
+        pass
+
+    return mol
 
 
-def frag_CN() -> FragEntry:
-    m = ase_molecule("HCN")
-    h_idx = [a.index for a in m if a.symbol == "H"][0]
-    m.symbols[h_idx] = "X"
-    return FragEntry(m, h_idx)
+def _rdkit_to_ase_atoms(mol: Chem.Mol) -> Atoms:
+    pt = Chem.GetPeriodicTable()
+    conf = mol.GetConformer()
+    syms = []
+    pos = []
+    for a in mol.GetAtoms():
+        z = a.GetAtomicNum()
+        if z == 0:
+            syms.append("X")
+        else:
+            syms.append(pt.GetElementSymbol(z))
+        p = conf.GetAtomPosition(a.GetIdx())
+        pos.append([float(p.x), float(p.y), float(p.z)])
+    return Atoms("".join(syms), positions=np.array(pos, dtype=float))
 
 
-def frag_SO2F() -> FragEntry:
-    m = Atoms(
-        "SOOFX",
-        positions=[
-            [0.000, 0.000, 0.000],  # S (attach)
-            [1.430, 0.000, 0.000],  # O
-            [-1.430, 0.000, 0.000],  # O
-            [0.000, 1.600, 0.000],  # F
-            [0.000, -1.800, 0.000],  # X
-        ],
-    )
-    return FragEntry(m, 4)
+def frag_from_smiles_by_replacing_terminal(
+    smiles: str,
+    placeholder_symbol: str = "Cl",
+    seed: int = 0,
+) -> FragEntry:
+    """
+    典型做法：用含 Cl 的前体（更稳定、力场可参数化），3D+优化后把 Cl 改成 X。
+    要求 placeholder 是 terminal（degree=1）。
+    """
+    mol = _rdkit_mol_3d(smiles, seed=seed)
+
+    # 找 terminal placeholder
+    ph_idx = None
+    for a in mol.GetAtoms():
+        if a.GetSymbol() == placeholder_symbol and a.GetDegree() == 1:
+            ph_idx = a.GetIdx()
+            break
+    if ph_idx is None:
+        raise ValueError(f"no terminal {placeholder_symbol} found in {smiles}")
+
+    attach_idx = mol.GetAtomWithIdx(ph_idx).GetNeighbors()[0].GetIdx()
+
+    # 优化完成后再把 placeholder 改成 dummy 原子（atomic num 0）
+    mol.GetAtomWithIdx(ph_idx).SetAtomicNum(0)
+
+    atoms = _rdkit_to_ase_atoms(mol)
+    dummy2_idx = int(ph_idx)
+
+    return FragEntry(atoms=atoms, dummy2_idx=dummy2_idx, attach_idx=int(attach_idx))
 
 
-def frag_OCH3() -> FragEntry:
-    # 用 CH3OH，把 OH 上的 H 变成 X（片段自身不含 O–H）
-    m = ase_molecule("CH3OH")
-    o_idx = [a.index for a in m if a.symbol == "O"][0]
-    h_indices = [a.index for a in m if a.symbol == "H"]
-    pos = m.get_positions()
-    dummy2_idx = sorted(
-        [(hi, float(np.linalg.norm(pos[hi] - pos[o_idx]))) for hi in h_indices],
-        key=lambda x: x[1],
-    )[0][0]
-    m.symbols[dummy2_idx] = "X"
-    return FragEntry(m, dummy2_idx)
+def make_frag_library_default(seed: int = 0) -> Dict[str, FragEntry]:
+    """
+    片段来源（SMILES）尽量选“常见真实分子前体”，再替换 terminal Cl/H 为 X。
+    - CH3: chloromethane (CCl)
+    - CF3: trifluoromethyl chloride (FC(F)(F)Cl)
+    - CN : cyanogen chloride (N#CCl) -> X-C#N
+    - OCH3: methyl hypochlorite (COCl) -> X-O-CH3
+    - COOCH3: methyl chloroformate (COC(=O)Cl) -> X-C(=O)-O-CH3
+    - SO2F: sulfonyl fluoride chloride 前体 (O=S(=O)(F)Cl) -> X-S(=O)2F
+    - F: hydrogen fluoride ([H]F) -> X-F
+    """
+    lib: Dict[str, FragEntry] = {}
 
+    # 这些用 Cl 作为 placeholder
+    lib["CH3"] = frag_from_smiles_by_replacing_terminal("CCl", "Cl", seed=seed)
+    lib["CF3"] = frag_from_smiles_by_replacing_terminal("FC(F)(F)Cl", "Cl", seed=seed)
+    lib["CN"] = frag_from_smiles_by_replacing_terminal("N#CCl", "Cl", seed=seed)
+    lib["OCH3"] = frag_from_smiles_by_replacing_terminal("COCl", "Cl", seed=seed)
+    lib["COOCH3"] = frag_from_smiles_by_replacing_terminal("COC(=O)Cl", "Cl", seed=seed)
+    lib["SO2F"] = frag_from_smiles_by_replacing_terminal("O=S(=O)(F)Cl", "Cl", seed=seed)
 
-def frag_COOCH3() -> FragEntry:
-    m = Atoms(
-        "COOCHHHH",
-        positions=[
-            [0.000, 0.000, 0.000],  # C (attach)
-            [1.210, 0.000, 0.000],  # O
-            [-1.330, 0.000, 0.000],  # O
-            [-2.760, 0.000, 0.000],  # C
-            [-3.390, 0.910, 0.000],  # H
-            [-3.390, -0.910, 0.000],  # H
-            [-2.760, 0.000, 1.090],  # H
-            [0.000, 0.000, 1.090],  # H(dummy)
-        ],
-    )
-    dummy2_idx = 7
-    m.symbols[dummy2_idx] = "X"
-    return FragEntry(m, dummy2_idx)
+    # F 用 H 作 placeholder：HF
+    lib["F"] = frag_from_smiles_by_replacing_terminal("[H]F", "H", seed=seed)
 
-
-def make_frag_library_default() -> Dict[str, FragEntry]:
-    return {
-        "CH3": frag_CH3(),
-        "F": frag_F(),
-        "CF3": frag_CF3(),
-        "CN": frag_CN(),
-        "SO2F": frag_SO2F(),
-        "OCH3": frag_OCH3(),
-        "COOCH3": frag_COOCH3(),
-    }
+    return lib
 
 
 # ============================================================
@@ -357,10 +390,7 @@ def list_all_h_indices(atoms: Atoms) -> List[int]:
     return [a.index for a in atoms if a.symbol == "H"]
 
 
-def find_oh_h_indices(atoms: Atoms, covalent_radius_factor: float = 1.15) -> List[int]:
-    """
-    用 covalent radii 推断 O–H：返回所有“与某个 O 只有一个邻居关系”的 H
-    """
+def find_oh_h_indices(atoms: Atoms, covalent_radius_factor: float = 1.18) -> List[int]:
     syms = atoms.get_chemical_symbols()
     adj = _bond_graph_by_radii(atoms, covalent_radius_factor=covalent_radius_factor)
 
@@ -381,7 +411,7 @@ def heavy_atom_count(atoms: Atoms) -> int:
 
 
 # ============================================================
-# 6) 随机旋转工具（用于“同一 skin 下尝试旋转等”）
+# 6) 随机旋转（用于同一 offset 下尝试构象）
 # ============================================================
 def _random_rotation_matrix(rng: random.Random) -> np.ndarray:
     # uniform random rotation via quaternion
@@ -393,7 +423,6 @@ def _random_rotation_matrix(rng: random.Random) -> np.ndarray:
     q3 = np.sqrt(u1) * np.sin(2 * np.pi * u3)
     q4 = np.sqrt(u1) * np.cos(2 * np.pi * u3)
 
-    # rotation matrix
     R = np.array(
         [
             [1 - 2 * (q3 * q3 + q4 * q4), 2 * (q2 * q3 - q1 * q4), 2 * (q2 * q4 + q1 * q3)],
@@ -416,111 +445,195 @@ def rotate_atoms_around_index(atoms: Atoms, center_idx: int, rng: random.Random)
 
 
 # ============================================================
-# 7) Dynamic skin 拼接：CLASH -> skin 增大；DISCONNECTED/ISOLATED -> skin 减小
+# 7) 关键 helper：用“被取代 H 的位置”作为默认距离基准
 # ============================================================
-def _skin_update_from_reasons(reasons: List[str], skin: float, step: float) -> float:
+def infer_anchor_atom_of_h(parent: Atoms, h_idx: int, covalent_radius_factor: float = 1.25) -> Optional[int]:
     """
-    你描述的规则：
-      - clash -> 往大了扩（skin += step）
-      - disconnected -> 往小了扩（skin -= step）
+    找该 H 连接的重原子 anchor。
+    - 优先用半径阈值的邻接
+    - 不稳时 fallback：最近的非 H 原子
     """
-    if not reasons:
-        return skin
+    if parent[h_idx].symbol != "H":
+        return None
 
-    # 统计
+    syms = parent.get_chemical_symbols()
+    adj = _bond_graph_by_radii(parent, covalent_radius_factor=covalent_radius_factor)
+    neigh = adj[h_idx]
+    heavy = [j for j in neigh if syms[j] != "H"]
+    if len(heavy) == 1:
+        return int(heavy[0])
+    if len(heavy) > 1:
+        # 取最近的重原子
+        pos = parent.get_positions()
+        d = [(j, float(np.linalg.norm(pos[j] - pos[h_idx]))) for j in heavy]
+        d.sort(key=lambda x: x[1])
+        return int(d[0][0])
+
+    # fallback：全局最近重原子
+    pos = parent.get_positions()
+    cand = [i for i, s in enumerate(syms) if s != "H"]
+    if not cand:
+        return None
+    d = [(i, float(np.linalg.norm(pos[i] - pos[h_idx]))) for i in cand]
+    d.sort(key=lambda x: x[1])
+    return int(d[0][0])
+
+
+def h_based_bond_distance(parent: Atoms, h_idx: int, anchor_idx: int) -> float:
+    pos = parent.get_positions()
+    return float(np.linalg.norm(pos[anchor_idx] - pos[h_idx]))
+
+
+def bond_distance_to_skin(
+    anchor_z: int,
+    attach_z: int,
+    bond_distance: float,
+    radii_scale: float = 1.0,
+) -> float:
+    """
+    把物理“目标键长”转换成 combine_2_mols_with_dummy 用的 skin。
+    假设 combine 内部是按 (r1+r2+skin) 之类控制目标距离。
+    """
+    r = covalent_radii
+    return float(bond_distance - radii_scale * (r[anchor_z] + r[attach_z]))
+
+
+# ============================================================
+# 8) Dynamic distance 拼接：同一 offset 下旋转多次，失败再调 offset
+# ============================================================
+def _offset_update_from_reasons(reasons: List[str], offset: float, step: float) -> float:
+    # clash -> 往大扩；disconnected/isolated -> 往小收
     cnt = {}
     for r in reasons:
         cnt[r] = cnt.get(r, 0) + 1
-
     n_clash = cnt.get("CLASH", 0)
     n_disc = cnt.get("DISCONNECTED", 0) + cnt.get("ISOLATED_ATOM", 0)
 
     if n_clash > n_disc:
-        return skin + step
+        return offset + step
     if n_disc > n_clash:
-        return skin - step
+        return offset - step
 
-    # 持平：不改（继续靠旋转/随机性）
-    return skin
+    # 没明显倾向：不动（交给随机旋转）
+    return offset
 
 
-def combine_with_dynamic_skin(
-    mol1: Atoms,
-    mol2: Atoms,
+def combine_with_dynamic_distance(
+    parent: Atoms,
+    frag: FragEntry,
     dummy1_idx: int,
-    dummy2_idx: int,
     rng: random.Random,
     filter_cfg: FilterConfig,
-    skin_cfg: DynamicSkinConfig,
+    dist_cfg: DynamicDistanceConfig,
 ) -> Tuple[Optional[Atoms], dict]:
     """
-    返回:
-      (new_atoms or None, info)
-    info 包含每次尝试的 skin / reason 统计，便于 debug。
+    默认目标距离：anchor-H 原有位置（d0），用 offset 微调。
     """
     info = {
-        "dynamic_skin": {
-            "start": skin_cfg.start,
-            "step": skin_cfg.step,
-            "rotations_per_skin": skin_cfg.rotations_per_skin,
-            "max_adjust": skin_cfg.max_adjust,
+        "dynamic_distance": {
+            "offset_start": dist_cfg.offset_start,
+            "step": dist_cfg.step,
+            "rotations_per_offset": dist_cfg.rotations_per_offset,
+            "max_adjust": dist_cfg.max_adjust,
+            "radii_scale": dist_cfg.radii_scale,
             "trials": [],
         }
     }
 
-    skin = float(skin_cfg.start)
-    for skin_try in range(skin_cfg.max_adjust):
-        # clamp
-        skin = max(skin_cfg.min_skin, min(skin_cfg.max_skin, skin))
+    anchor_idx = infer_anchor_atom_of_h(parent, dummy1_idx)
+    if anchor_idx is None:
+        return None, {**info, "fail_reason": "NO_ANCHOR_FOR_H"}
 
-        reasons_this_skin: List[str] = []
-        for rot_try in range(skin_cfg.rotations_per_skin):
-            frag_rot = rotate_atoms_around_index(mol2, center_idx=dummy2_idx, rng=rng)
+    d0 = h_based_bond_distance(parent, dummy1_idx, anchor_idx)
+    anchor_z = int(parent[anchor_idx].number)
+    attach_z = int(frag.atoms[frag.attach_idx].number)
+
+    offset = float(dist_cfg.offset_start)
+
+    for k in range(dist_cfg.max_adjust):
+        offset = max(dist_cfg.min_offset, min(dist_cfg.max_offset, offset))
+
+        reasons_this_offset: List[str] = []
+        for rtry in range(dist_cfg.rotations_per_offset):
+            bond_d = d0 + offset
+            skin = bond_distance_to_skin(
+                anchor_z=anchor_z,
+                attach_z=attach_z,
+                bond_distance=bond_d,
+                radii_scale=dist_cfg.radii_scale,
+            )
+
+            frag_rot = rotate_atoms_around_index(frag.atoms, center_idx=frag.dummy2_idx, rng=rng)
 
             try:
                 new_mol = combine_2_mols_with_dummy(
-                    mol1=mol1.copy(),
+                    mol1=parent.copy(),
                     mol2=frag_rot,
                     dummy1_idx=int(dummy1_idx),
-                    dummy2_idx=int(dummy2_idx),
+                    dummy2_idx=int(frag.dummy2_idx),
                     skin=float(skin),
                 )
             except Exception as e:
-                reasons_this_skin.append("COMBINE_EXCEPTION")
-                info["dynamic_skin"]["trials"].append(
-                    {"skin": skin, "skin_try": skin_try, "rot_try": rot_try, "reason": "COMBINE_EXCEPTION", "exc": repr(e)}
+                reasons_this_offset.append("COMBINE_EXCEPTION")
+                info["dynamic_distance"]["trials"].append(
+                    {
+                        "adjust_i": k,
+                        "rot_i": rtry,
+                        "d0": d0,
+                        "offset": offset,
+                        "bond_d": bond_d,
+                        "skin": skin,
+                        "reason": "COMBINE_EXCEPTION",
+                        "exc": repr(e),
+                    }
                 )
                 continue
 
             ok, reason = topo_geometry_filter(new_mol, filter_cfg)
-            info["dynamic_skin"]["trials"].append(
-                {"skin": skin, "skin_try": skin_try, "rot_try": rot_try, "reason": reason}
+            info["dynamic_distance"]["trials"].append(
+                {
+                    "adjust_i": k,
+                    "rot_i": rtry,
+                    "d0": d0,
+                    "offset": offset,
+                    "bond_d": bond_d,
+                    "skin": skin,
+                    "reason": reason,
+                }
             )
+
             if ok:
-                info["dynamic_skin"]["final_skin"] = skin
-                info["dynamic_skin"]["final_skin_try"] = skin_try
-                info["dynamic_skin"]["final_rot_try"] = rot_try
+                info["dynamic_distance"]["final"] = {
+                    "d0": d0,
+                    "offset": offset,
+                    "bond_d": bond_d,
+                    "skin": skin,
+                    "adjust_i": k,
+                    "rot_i": rtry,
+                    "anchor_idx": int(anchor_idx),
+                    "attach_idx": int(frag.attach_idx),
+                }
                 return new_mol, info
 
-            reasons_this_skin.append(reason)
+            reasons_this_offset.append(reason)
 
-        # 本 skin 全失败 -> 根据失败类型更新 skin
-        new_skin = _skin_update_from_reasons(reasons_this_skin, skin=skin, step=skin_cfg.step)
-        if new_skin == skin:
-            # 没有明确方向时也走一步随机扰动，避免卡死
-            new_skin = skin + (skin_cfg.step if rng.random() < 0.5 else -skin_cfg.step)
-        skin = new_skin
+        # 该 offset 下全失败 -> 调 offset
+        new_offset = _offset_update_from_reasons(reasons_this_offset, offset=offset, step=dist_cfg.step)
+        if new_offset == offset:
+            # 没倾向就随机走一步，避免停滞
+            new_offset = offset + (dist_cfg.step if rng.random() < 0.5 else -dist_cfg.step)
+        offset = new_offset
 
-    return None, info
+    return None, {**info, "fail_reason": "DYNAMIC_DISTANCE_FAILED"}
 
 
 # ============================================================
-# 8) 单步替换：调用 dynamic skin combine
+# 9) 单步替换（基于 dynamic distance）
 # ============================================================
 @dataclass(frozen=True)
 class SubstituteConfig:
-    skin_cfg: DynamicSkinConfig = DEFAULT_SKIN_CFG
-    max_local_tries: int = 20  # 每一步（选 H/选基团/拼接）总尝试上限
+    dist_cfg: DynamicDistanceConfig = DEFAULT_DIST_CFG
+    max_local_tries: int = 25
 
 
 def substitute_once_dynamic(
@@ -539,20 +652,19 @@ def substitute_once_dynamic(
     if group_name not in frag_lib:
         return None, {"ok": False, "reason": "BAD_GROUP"}
 
-    frag_entry = frag_lib[group_name]
-    new_mol, dyn_info = combine_with_dynamic_skin(
-        mol1=mol,
-        mol2=frag_entry.atoms,
-        dummy1_idx=int(h_idx),
-        dummy2_idx=int(frag_entry.dummy2_idx),
+    frag = frag_lib[group_name]
+    new_mol, dyn_info = combine_with_dynamic_distance(
+        parent=mol,
+        frag=frag,
+        dummy1_idx=h_idx,
         rng=rng,
         filter_cfg=filter_cfg,
-        skin_cfg=sub_cfg.skin_cfg,
+        dist_cfg=sub_cfg.dist_cfg,
     )
     if new_mol is None:
         return None, {
             "ok": False,
-            "reason": "DYNAMIC_SKIN_FAILED",
+            "reason": dyn_info.get("fail_reason", "DYNAMIC_FAILED"),
             "replace_h": int(h_idx),
             "group": group_name,
             **dyn_info,
@@ -568,10 +680,10 @@ def substitute_once_dynamic(
 
 
 # ============================================================
-# 9) 随机取代：禁 O–H 时先消掉所有 O–H
+# 10) 随机取代：禁 O–H 时先消掉所有 O–H
 # ============================================================
 SAFE_GROUPS_FOR_OH_REMOVAL = ("CH3", "CF3", "CN", "F", "SO2F", "COOCH3")
-# 注意：不要用 "OCH3" 去替换 O–H，否则容易形成 O–O（会被 forbid_oo_bond 过滤）
+# 注意：不要用 OCH3 去替换 O–H，容易引入 O–O（被 forbid_oo_bond 过滤）
 
 
 def random_functionalize(
@@ -586,26 +698,25 @@ def random_functionalize(
     mol = parent_atoms.copy()
     steps: List[dict] = []
 
-    def _try_one_step(h_candidates: List[int], g_candidates: List[str], phase: str) -> bool:
-        nonlocal mol, steps
-        if not h_candidates or not g_candidates:
-            return False
+    def _phase_candidates(phase: str) -> Tuple[List[int], List[str]]:
+        if phase == "remove_OH":
+            h_list = find_oh_h_indices(mol)
+            g_list = [g for g in SAFE_GROUPS_FOR_OH_REMOVAL if g in frag_lib]
+            return h_list, g_list
+        else:
+            return list_all_h_indices(mol), list(frag_lib.keys())
 
+    def _try_one_step(phase: str) -> bool:
+        nonlocal mol, steps
         for _ in range(sub_cfg.max_local_tries):
             if heavy_atom_count(mol) >= max_heavy:
                 return False
-
-            # 重新计算候选（因为 mol 在变化）
-            if phase == "remove_OH":
-                h_candidates2 = find_oh_h_indices(mol)
-            else:
-                h_candidates2 = list_all_h_indices(mol)
-
-            if not h_candidates2:
+            h_list, g_list = _phase_candidates(phase)
+            if not h_list or not g_list:
                 return False
 
-            h_idx = rng.choice(h_candidates2)
-            gname = rng.choice(g_candidates)
+            h_idx = rng.choice(h_list)
+            gname = rng.choice(g_list)
 
             new_mol, meta = substitute_once_dynamic(
                 mol=mol,
@@ -623,35 +734,28 @@ def random_functionalize(
             steps.append(meta)
             mol = new_mol
             return True
-
         return False
 
     # Phase A: 强制消除 O–H
     if filter_cfg.forbid_oh_bond:
         while len(steps) < n_steps and heavy_atom_count(mol) < max_heavy:
-            oh_list = find_oh_h_indices(mol)
-            if not oh_list:
+            if not find_oh_h_indices(mol):
                 break
-            g_candidates = [g for g in SAFE_GROUPS_FOR_OH_REMOVAL if g in frag_lib]
-            ok = _try_one_step(oh_list, g_candidates, phase="remove_OH")
-            if not ok:
+            if not _try_one_step("remove_OH"):
                 break
 
     # Phase B: 普通随机取代
     while len(steps) < n_steps and heavy_atom_count(mol) < max_heavy:
-        h_list = list_all_h_indices(mol)
-        if not h_list:
+        if not list_all_h_indices(mol):
             break
-        g_candidates = list(frag_lib.keys())
-        ok = _try_one_step(h_list, g_candidates, phase="random")
-        if not ok:
+        if not _try_one_step("random"):
             break
 
     return mol, steps
 
 
 # ============================================================
-# 10) 并行：worker + 对外函数
+# 11) 并行生成数据库
 # ============================================================
 G_PARENTS = None
 G_PARENT_IDS = None
@@ -670,9 +774,8 @@ def _init_worker(parents, parent_ids, frag_lib, max_heavy, seed0, filter_cfg_dic
     G_MAX_HEAVY = max_heavy
     G_SEED0 = seed0
     G_FILTER_CFG = FilterConfig(**filter_cfg_dict)
-
-    skin_cfg = DynamicSkinConfig(**sub_cfg_dict["skin_cfg"])
-    G_SUB_CFG = SubstituteConfig(skin_cfg=skin_cfg, max_local_tries=int(sub_cfg_dict["max_local_tries"]))
+    dist_cfg = DynamicDistanceConfig(**sub_cfg_dict["dist_cfg"])
+    G_SUB_CFG = SubstituteConfig(dist_cfg=dist_cfg, max_local_tries=int(sub_cfg_dict["max_local_tries"]))
 
 
 def _process_single_attempt(attempt_idx: int):
@@ -728,7 +831,7 @@ def build_functionalized_library_db(
     if filter_cfg is None:
         filter_cfg = FilterConfig()
     if frag_lib is None:
-        frag_lib = make_frag_library_default()
+        frag_lib = make_frag_library_default(seed=seed)
     if sub_cfg is None:
         sub_cfg = SubstituteConfig()
     if n_cores is None:
@@ -781,7 +884,7 @@ def build_functionalized_library_db(
             max_heavy,
             seed * 10_000_000,
             filter_cfg.__dict__,
-            {"skin_cfg": sub_cfg.skin_cfg.__dict__, "max_local_tries": sub_cfg.max_local_tries},
+            {"dist_cfg": sub_cfg.dist_cfg.__dict__, "max_local_tries": sub_cfg.max_local_tries},
         )
 
         if debug:
@@ -817,14 +920,17 @@ def build_functionalized_library_db(
         "unique_total_written": len(inchi_seen),
         "n_cores": n_cores,
         "filter_cfg": filter_cfg.__dict__,
-        "sub_cfg": {"skin_cfg": sub_cfg.skin_cfg.__dict__, "max_local_tries": sub_cfg.max_local_tries},
+        "sub_cfg": {"dist_cfg": sub_cfg.dist_cfg.__dict__, "max_local_tries": sub_cfg.max_local_tries},
     }
 
 
 # ============================================================
-# 11) Debug/测试：复刻你案例 + 单分子生成 N 个取代产物
+# 12) Debug/测试
 # ============================================================
 def debug_case_like_user_script(base_atoms: Atoms, seed: int = 0):
+    """
+    复刻你的对照：取第一个 H，替换 CH3 / F，打印过滤结果。
+    """
     print("=== DEBUG: case_like_user_script ===")
     print(f"[INFO] base formula = {base_atoms.get_chemical_formula()}")
     h_list = [a.index for a in base_atoms if a.symbol == "H"]
@@ -836,12 +942,12 @@ def debug_case_like_user_script(base_atoms: Atoms, seed: int = 0):
     target_h_idx = h_list[0]
     print(f"[INFO] target_h_idx = {target_h_idx}")
 
-    frag_lib = make_frag_library_default()
+    frag_lib = make_frag_library_default(seed=seed)
     cfg = FilterConfig()
-    sub_cfg = SubstituteConfig(skin_cfg=DEFAULT_SKIN_CFG)
+    sub_cfg = SubstituteConfig(dist_cfg=DEFAULT_DIST_CFG)
     rng = random.Random(seed)
 
-    for g in ["CH3", "F"]:
+    for g in ["CH3", "F", "CF3", "CN"]:
         new_mol, meta = substitute_once_dynamic(
             mol=base_atoms,
             h_idx=target_h_idx,
@@ -852,24 +958,17 @@ def debug_case_like_user_script(base_atoms: Atoms, seed: int = 0):
             sub_cfg=sub_cfg,
         )
         if new_mol is None:
-            print(f"[INFO] {g} substitute FAILED meta={meta.get('reason')}")
+            print(f"[INFO] {g} substitute FAILED reason={meta.get('reason')}")
             continue
 
-        smi, inchi, log = atoms_to_smiles_inchi_fast_verbose(new_mol)
-        print(f"[INFO] {g} substituted atoms: {new_mol.get_chemical_formula()}")
-        print(f"[INFO] {g} smiles:", smi)
-        print(f"[INFO] {g} inchi :", inchi)
-        passed, _, _, reason = clean_filter_atoms(new_mol, cfg)
-        print(f"[INFO] {g} filter_pass:", passed, "reason:", reason)
-        if smi is None:
-            print("[RDKit LOG]\n", log)
+        passed, smiles, inchi, reason = clean_filter_atoms(new_mol, cfg)
+        print(f"[INFO] {g} smiles={smiles} pass={passed} reason={reason}")
 
-        dyn = meta.get("dynamic_skin", {})
-        if dyn:
-            print(f"[INFO] {g} dynamic_skin final_skin = {dyn.get('final_skin', None)}")
+        fin = meta.get("dynamic_distance", {}).get("final", None)
+        if fin:
+            print(f"[INFO] {g} final bond_d={fin.get('bond_d'):.3f} offset={fin.get('offset'):.3f} skin={fin.get('skin'):.3f}")
 
-    oh_list = find_oh_h_indices(base_atoms)
-    print(f"[INFO] base OH-H count (geom inferred) = {len(oh_list)}")
+    print(f"[INFO] base inferred OH-H count = {len(find_oh_h_indices(base_atoms))}")
     print("=== END DEBUG ===")
 
 
@@ -888,7 +987,7 @@ def generate_random_substitutions(
     if filter_cfg is None:
         filter_cfg = FilterConfig()
     if frag_lib is None:
-        frag_lib = make_frag_library_default()
+        frag_lib = make_frag_library_default(seed=seed)
     if sub_cfg is None:
         sub_cfg = SubstituteConfig()
 
@@ -939,7 +1038,7 @@ def generate_random_substitutions(
             "steps": steps,
             "smiles": smiles,
             "inchi": inchi,
-            "sub_cfg": {"skin_cfg": sub_cfg.skin_cfg.__dict__, "max_local_tries": sub_cfg.max_local_tries},
+            "sub_cfg": {"dist_cfg": sub_cfg.dist_cfg.__dict__, "max_local_tries": sub_cfg.max_local_tries},
         }
         outs.append((new_atoms, meta))
 
