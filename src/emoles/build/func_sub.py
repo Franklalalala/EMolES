@@ -584,70 +584,76 @@ SAFE_GROUPS_FOR_OH_REMOVAL = ("CH3", "CF3", "CN", "F", "SO2F", "SO2CH3", "COOCH3
 
 
 def random_functionalize(
-    parent_atoms: Atoms,
-    frag_lib: Dict[str, FragEntry],
-    rng: random.Random,
-    n_steps: int,
-    max_heavy: int,
-    filter_cfg: FilterConfig,
-    sub_cfg: SubstituteConfig,
-) -> Tuple[Atoms, List[dict]]:
+        parent_atoms: Atoms,
+        frag_lib: dict,
+        rng: random.Random,
+        n_steps: int,
+        max_heavy: int,
+        filter_cfg: FilterConfig,
+        sub_cfg: SubstituteConfig,
+        force_different_groups: bool = False,  # 【新增】强迫每次取代用不同的官能团
+        fixed_group: Optional[str] = None,  # 【新增】固定使用同一种官能团
+):
+    """
+    对母体分子进行连续 n_steps 的随机取代。
+    """
+    from emoles.build.func_sub import get_ch_pairs, substitute_once_rigid  # 确保内部依赖正常
+
     mol = parent_atoms.copy()
-    steps: List[dict] = []
+    steps_record = []
+    used_groups = set()
 
-    def _phase_candidates(phase: str) -> Tuple[List[int], List[str]]:
-        if phase == "remove_OH":
-            h_list = find_oh_h_indices(mol)
-            g_list = [g for g in SAFE_GROUPS_FOR_OH_REMOVAL if g in frag_lib]
-            return h_list, g_list
-        return list_all_h_indices(mol), list(frag_lib.keys())
-
-    def _try_one_step(phase: str) -> bool:
-        nonlocal mol, steps
-        for _ in range(sub_cfg.max_local_tries):
-            if heavy_atom_count(mol) >= max_heavy:
-                return False
-            h_list, g_list = _phase_candidates(phase)
-            if not h_list or not g_list:
-                return False
-
-            h_idx = rng.choice(h_list)
-            gname = rng.choice(g_list)
-
-            new_mol, meta = substitute_once_rigid(
-                mol=mol,
-                h_idx=h_idx,
-                group_name=gname,
-                frag_lib=frag_lib,
-                filter_cfg=filter_cfg,
-                sub_cfg=sub_cfg,
-                rng=rng
-            )
-
-            if new_mol is None:
-                continue
-
-            meta["phase"] = phase
-            steps.append(meta)
-            mol = new_mol
-            return True
-        return False
-
-    if filter_cfg.forbid_oh_bond:
-        while len(steps) < n_steps and heavy_atom_count(mol) < max_heavy:
-            if not find_oh_h_indices(mol):
-                break
-            if not _try_one_step("remove_OH"):
-                break
-
-    while len(steps) < n_steps and heavy_atom_count(mol) < max_heavy:
-        if not list_all_h_indices(mol):
-            break
-        if not _try_one_step("random"):
+    for _ in range(n_steps):
+        ch_pairs = get_ch_pairs(mol)
+        if not ch_pairs:
             break
 
-    return mol, steps
+        # ====== 【新增的官能团选择逻辑】 ======
+        if fixed_group is not None:
+            group_name = fixed_group
+        elif force_different_groups:
+            avail_groups = list(set(frag_lib.keys()) - used_groups)
+            if not avail_groups:
+                break  # 没有可选的不同官能团了
+            group_name = rng.choice(avail_groups)
+        else:
+            group_name = rng.choice(list(frag_lib.keys()))
+        # ======================================
 
+        h_idx = rng.choice(ch_pairs)
+
+        new_mol, meta = substitute_once_rigid(
+            mol=mol,
+            h_idx=h_idx,
+            group_name=group_name,
+            frag_lib=frag_lib,
+            filter_cfg=filter_cfg,
+            sub_cfg=sub_cfg,
+            rng=rng,
+        )
+
+        if new_mol is None:
+            break
+
+        import rdkit.Chem.Descriptors as Descriptors
+        from emoles.build.func_sub import atoms_to_smiles
+        smi = atoms_to_smiles(new_mol)
+        if smi is None:
+            break
+        from rdkit import Chem
+        m = Chem.MolFromSmiles(smi)
+        if m and Descriptors.HeavyAtomCount(m) > max_heavy:
+            break
+
+        mol = new_mol
+        used_groups.add(group_name)  # 记录已使用
+        steps_record.append({
+            "replace_h": h_idx,
+            "group": group_name,
+            "meta": meta
+        })
+
+    return mol, steps_record
 
 # ============================================================
 # 10) Fixed-group exact-depth 分层穷举
