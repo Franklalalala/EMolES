@@ -1,5 +1,3 @@
-# emoles.build.func_sub
-
 from __future__ import annotations
 
 import contextlib
@@ -20,9 +18,6 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem.rdDetermineBonds import DetermineBonds
 from rdkit.rdBase import WrapLogs
-
-
-# Legacy random placement method removed; replaced by rigid-body alignment approach.
 
 
 # ============================================================
@@ -294,9 +289,9 @@ def _rdkit_to_ase_atoms(mol: Chem.Mol) -> Atoms:
 
 
 def frag_from_smiles_by_replacing_terminal(
-        smiles: str,
-        placeholder_symbol: str = "Cl",
-        seed: int = 0,
+    smiles: str,
+    placeholder_symbol: str = "Cl",
+    seed: int = 0,
 ) -> FragEntry:
     mol = _rdkit_mol_3d(smiles, seed=seed)
 
@@ -386,20 +381,32 @@ def infer_anchor_atom_of_h(parent: Atoms, h_idx: int, covalent_radius_factor: fl
 @dataclass(frozen=True)
 class SubstituteConfig:
     max_local_tries: int = 25
-    dihedral_step: int = 10  # 二面角扫描步长
-    stochastic_dihedral: bool = True  # 是否在合法构象中随机采样以保证多样性
+    dihedral_step: int = 10
+    stochastic_dihedral: bool = True
+
+
+@dataclass(frozen=True)
+class ExhaustiveEnumConfig:
+    # 每个状态最多扫描多少个候选 H 位点；None = 全量
+    max_site_candidates_per_state: Optional[int] = None
+
+    # 每一层最终最多保留多少个唯一结构；None = 全量
+    max_states_per_depth: Optional[int] = None
+
+    # 整个 parent+group 枚举流程最多尝试多少次 substitute；None = 不限
+    max_total_substitution_attempts: Optional[int] = None
 
 
 # ============================================================
-# 7) [重构] Rigid Body 拼接算法
+# 7) Rigid Body 拼接算法
 # ============================================================
 def combine_with_rigid_body(
-        parent: Atoms,
-        frag: FragEntry,
-        dummy1_idx: int,
-        filter_cfg: FilterConfig,
-        sub_cfg: SubstituteConfig,
-        rng: random.Random
+    parent: Atoms,
+    frag: FragEntry,
+    dummy1_idx: int,
+    filter_cfg: FilterConfig,
+    sub_cfg: SubstituteConfig,
+    rng: random.Random
 ) -> Tuple[Optional[Atoms], dict]:
     info = {
         "frag_attach_idx": int(frag.attach_idx),
@@ -410,7 +417,6 @@ def combine_with_rigid_body(
     base = parent.copy()
     sub = frag.atoms.copy()
 
-    # 1. 向量解析
     base_anchor_idx = infer_anchor_atom_of_h(base, dummy1_idx)
     if base_anchor_idx is None:
         return None, {**info, "fail_reason": "NO_ANCHOR_FOR_H"}
@@ -423,7 +429,6 @@ def combine_with_rigid_body(
     v_sub = sub.positions[sub_dummy_idx] - sub.positions[sub_anchor_idx]
     v_sub_norm = v_sub / np.linalg.norm(v_sub)
 
-    # 2. 三维姿态对齐 (修复非正交轴叉乘 Bug)
     vec1 = v_sub_norm
     vec2 = -v_base_norm
     if not np.allclose(vec1, vec2):
@@ -436,7 +441,6 @@ def combine_with_rigid_body(
         else:
             sub.rotate(vec1, vec2, center=sub.positions[sub_anchor_idx])
 
-    # 3. 初始成键平移
     r1 = covalent_radii[base.numbers[base_anchor_idx]]
     r2 = covalent_radii[sub.numbers[sub_anchor_idx]]
     ideal_bond_length = r1 + r2
@@ -448,14 +452,11 @@ def combine_with_rigid_body(
     del sub[sub_dummy_idx]
     del base[dummy1_idx]
 
-    # === 【新增代码】修正由于删除原子导致的索引偏移 ===
     if dummy1_idx < base_anchor_idx:
         base_anchor_idx -= 1
     if sub_dummy_idx < sub_anchor_idx:
         sub_anchor_idx -= 1
-    # ============================================
 
-    # 4. 二面角智能扫描 (剔除 1-2 成键距离干扰)
     valid_angles = []
     best_angle = 0
     max_min_dist = -1.0
@@ -466,7 +467,7 @@ def combine_with_rigid_body(
         test_sub.rotate(angle, v_base_norm, center=target_pos)
 
         dist_mat = _pairwise_distances_two(base.positions, test_sub.positions)
-        dist_mat[base_anchor_idx, sub_anchor_idx] = 1e9  # Mask the newly formed 1-2 bond
+        dist_mat[base_anchor_idx, sub_anchor_idx] = 1e9
 
         min_nonbonded = np.min(dist_mat)
 
@@ -478,7 +479,6 @@ def combine_with_rigid_body(
             best_angle = angle
             best_positions = test_sub.positions.copy()
 
-    # 5. 多样性采样 (Stochastic Diversity)
     if valid_angles and sub_cfg.stochastic_dihedral:
         chosen = rng.choice(valid_angles)
         best_angle, final_min_dist, best_positions = chosen
@@ -488,10 +488,9 @@ def combine_with_rigid_body(
     sub.positions = best_positions
     actual_bond_length = ideal_bond_length
 
-    # 6. 位阻推远限制 (修复“无限偷偷推远”导致超长键的 Bug)
     if final_min_dist < filter_cfg.min_distance_clash:
         resolved = False
-        for push_steps in range(1, 5):  # Maximum push: 4 * 0.1 = 0.4 Angstroms
+        for _push_steps in range(1, 5):
             sub.positions += v_base_norm * 0.1
             actual_bond_length += 0.1
 
@@ -505,21 +504,28 @@ def combine_with_rigid_body(
                 break
 
         if not resolved:
-            return None, {**info, "fail_reason": "STILL_CLASHING_AFTER_PUSH", "best_dist": float(final_min_dist)}
+            return None, {
+                **info,
+                "fail_reason": "STILL_CLASHING_AFTER_PUSH",
+                "best_dist": float(final_min_dist),
+            }
 
-    # 7. 组合并利用现有拓扑规则终验
     combined = base.copy()
     combined.extend(sub)
 
     ok, reason = topo_geometry_filter(combined, filter_cfg)
     if not ok:
-        return None, {**info, "fail_reason": f"FILTER_FAIL: {reason}", "best_dist": float(final_min_dist)}
+        return None, {
+            **info,
+            "fail_reason": f"FILTER_FAIL: {reason}",
+            "best_dist": float(final_min_dist),
+        }
 
     info["final"] = {
         "bond_length_ideal": float(ideal_bond_length),
         "bond_length_actual": float(actual_bond_length),
         "dihedral_angle": best_angle,
-        "min_nonbonded_dist": float(final_min_dist)
+        "min_nonbonded_dist": float(final_min_dist),
     }
     return combined, info
 
@@ -528,13 +534,13 @@ def combine_with_rigid_body(
 # 8) Single substitution
 # ============================================================
 def substitute_once_rigid(
-        mol: Atoms,
-        h_idx: int,
-        group_name: str,
-        frag_lib: Dict[str, FragEntry],
-        filter_cfg: FilterConfig,
-        sub_cfg: SubstituteConfig,
-        rng: random.Random
+    mol: Atoms,
+    h_idx: int,
+    group_name: str,
+    frag_lib: Dict[str, FragEntry],
+    filter_cfg: FilterConfig,
+    sub_cfg: SubstituteConfig,
+    rng: random.Random
 ) -> Tuple[Optional[Atoms], dict]:
     if h_idx < 0 or h_idx >= len(mol):
         return None, {"ok": False, "reason": "BAD_H_IDX"}
@@ -545,8 +551,12 @@ def substitute_once_rigid(
 
     frag = frag_lib[group_name]
     new_mol, rigid_info = combine_with_rigid_body(
-        parent=mol, frag=frag, dummy1_idx=h_idx,
-        filter_cfg=filter_cfg, sub_cfg=sub_cfg, rng=rng
+        parent=mol,
+        frag=frag,
+        dummy1_idx=h_idx,
+        filter_cfg=filter_cfg,
+        sub_cfg=sub_cfg,
+        rng=rng
     )
 
     if new_mol is None:
@@ -574,13 +584,13 @@ SAFE_GROUPS_FOR_OH_REMOVAL = ("CH3", "CF3", "CN", "F", "SO2F", "SO2CH3", "COOCH3
 
 
 def random_functionalize(
-        parent_atoms: Atoms,
-        frag_lib: Dict[str, FragEntry],
-        rng: random.Random,
-        n_steps: int,
-        max_heavy: int,
-        filter_cfg: FilterConfig,
-        sub_cfg: SubstituteConfig,
+    parent_atoms: Atoms,
+    frag_lib: Dict[str, FragEntry],
+    rng: random.Random,
+    n_steps: int,
+    max_heavy: int,
+    filter_cfg: FilterConfig,
+    sub_cfg: SubstituteConfig,
 ) -> Tuple[Atoms, List[dict]]:
     mol = parent_atoms.copy()
     steps: List[dict] = []
@@ -605,9 +615,13 @@ def random_functionalize(
             gname = rng.choice(g_list)
 
             new_mol, meta = substitute_once_rigid(
-                mol=mol, h_idx=h_idx, group_name=gname,
-                frag_lib=frag_lib, filter_cfg=filter_cfg,
-                sub_cfg=sub_cfg, rng=rng
+                mol=mol,
+                h_idx=h_idx,
+                group_name=gname,
+                frag_lib=frag_lib,
+                filter_cfg=filter_cfg,
+                sub_cfg=sub_cfg,
+                rng=rng
             )
 
             if new_mol is None:
@@ -636,7 +650,158 @@ def random_functionalize(
 
 
 # ============================================================
-# 10) Parallel DB generation
+# 10) Fixed-group exact-depth 分层穷举
+# ============================================================
+def candidate_h_indices_for_fixed_group(
+    mol: Atoms,
+    group_name: str,
+    filter_cfg: FilterConfig,
+) -> List[int]:
+    """
+    固定官能团时的候选位点规则：
+    1) 如果 forbid_oh_bond=True 且当前还有 OH-H，则优先只处理 OH-H；
+    2) 且只有 SAFE_GROUPS_FOR_OH_REMOVAL 里的 group 才允许替换 OH-H；
+    3) 否则返回当前分子全部 H。
+    """
+    if filter_cfg.forbid_oh_bond:
+        oh_h = sorted(find_oh_h_indices(mol))
+        if oh_h:
+            if group_name not in SAFE_GROUPS_FOR_OH_REMOVAL:
+                return []
+            return oh_h
+
+    return sorted(list_all_h_indices(mol))
+
+
+def enumerate_fixed_group_layers(
+    parent_atoms: Atoms,
+    group_name: str,
+    frag_lib: Dict[str, FragEntry],
+    rng: random.Random,
+    max_depth: int,
+    max_heavy: int,
+    filter_cfg: FilterConfig,
+    sub_cfg: SubstituteConfig,
+    enum_cfg: ExhaustiveEnumConfig,
+) -> Dict[int, List[dict]]:
+    """
+    固定一个 group_name，对 depth=1..max_depth 做 exact-depth 分层穷举。
+
+    返回:
+        layers[1] = 所有恰好 1 次取代的唯一结构
+        layers[2] = 所有恰好 2 次取代的唯一结构
+        ...
+    特点：
+    - 允许在前一步新接上的基团上继续取代
+    - 每层按 InChI 去重
+    - 不同 depth 分开统计
+    """
+    if max_depth <= 0:
+        return {}
+    if group_name not in frag_lib:
+        return {}
+
+    layers: Dict[int, List[dict]] = {}
+    current_layer = [{
+        "atoms": parent_atoms.copy(),
+        "steps": [],
+    }]
+
+    total_attempts = 0
+    hard_stop = False
+
+    for depth in range(1, max_depth + 1):
+        next_map = {}
+
+        for state in current_layer:
+            mol = state["atoms"]
+            prev_steps = state["steps"]
+
+            if heavy_atom_count(mol) >= max_heavy:
+                continue
+
+            h_list = candidate_h_indices_for_fixed_group(
+                mol=mol,
+                group_name=group_name,
+                filter_cfg=filter_cfg,
+            )
+
+            if enum_cfg.max_site_candidates_per_state is not None:
+                h_list = h_list[: int(enum_cfg.max_site_candidates_per_state)]
+
+            if not h_list:
+                continue
+
+            for h_idx in h_list:
+                if (
+                    enum_cfg.max_total_substitution_attempts is not None
+                    and total_attempts >= int(enum_cfg.max_total_substitution_attempts)
+                ):
+                    hard_stop = True
+                    break
+
+                total_attempts += 1
+
+                new_mol, meta = substitute_once_rigid(
+                    mol=mol,
+                    h_idx=h_idx,
+                    group_name=group_name,
+                    frag_lib=frag_lib,
+                    filter_cfg=filter_cfg,
+                    sub_cfg=sub_cfg,
+                    rng=rng,
+                )
+
+                if new_mol is None:
+                    continue
+
+                if heavy_atom_count(new_mol) > max_heavy:
+                    continue
+
+                passed, smiles, inchi, _ = clean_filter_atoms(new_mol, filter_cfg)
+                if not passed or smiles is None or inchi is None:
+                    continue
+
+                # 仅在同一 depth 内去重
+                if inchi in next_map:
+                    continue
+
+                meta["phase"] = "fixed_group_exact"
+                meta["fixed_group"] = group_name
+
+                rec = {
+                    "atoms": new_mol,
+                    "steps": prev_steps + [meta],
+                    "smiles": smiles,
+                    "inchi": inchi,
+                    "depth": depth,
+                    "group_name": group_name,
+                }
+                next_map[inchi] = rec
+
+            if hard_stop:
+                break
+
+        layer_records = [next_map[k] for k in sorted(next_map.keys())]
+
+        if enum_cfg.max_states_per_depth is not None:
+            layer_records = layer_records[: int(enum_cfg.max_states_per_depth)]
+
+        layers[depth] = layer_records
+
+        if hard_stop or not layer_records:
+            break
+
+        current_layer = [{
+            "atoms": rec["atoms"],
+            "steps": rec["steps"],
+        } for rec in layer_records]
+
+    return layers
+
+
+# ============================================================
+# 11) Parallel DB generation (保留旧接口)
 # ============================================================
 G_PARENTS = None
 G_PARENT_IDS = None
@@ -655,8 +820,6 @@ def _init_worker(parents, parent_ids, frag_lib, max_heavy, seed0, filter_cfg_dic
     G_MAX_HEAVY = max_heavy
     G_SEED0 = seed0
     G_FILTER_CFG = FilterConfig(**filter_cfg_dict)
-
-    # Adapt carefully to the updated SubstituteConfig
     G_SUB_CFG = SubstituteConfig(
         max_local_tries=int(sub_cfg_dict.get("max_local_tries", 25)),
         dihedral_step=int(sub_cfg_dict.get("dihedral_step", 10)),
@@ -702,17 +865,17 @@ def _process_single_attempt(attempt_idx: int):
 
 
 def build_functionalized_library_db(
-        src_db: str,
-        dst_db: str,
-        target_attempts: int = 150_000,
-        seed: int = 0,
-        max_heavy: int = 12,
-        n_cores: Optional[int] = None,
-        write_base: bool = True,
-        filter_cfg: Optional[FilterConfig] = None,
-        frag_lib: Optional[Dict[str, FragEntry]] = None,
-        sub_cfg: Optional[SubstituteConfig] = None,
-        debug: bool = True,
+    src_db: str,
+    dst_db: str,
+    target_attempts: int = 150_000,
+    seed: int = 0,
+    max_heavy: int = 12,
+    n_cores: Optional[int] = None,
+    write_base: bool = True,
+    filter_cfg: Optional[FilterConfig] = None,
+    frag_lib: Optional[Dict[str, FragEntry]] = None,
+    sub_cfg: Optional[SubstituteConfig] = None,
+    debug: bool = True,
 ):
     if filter_cfg is None:
         filter_cfg = FilterConfig()
