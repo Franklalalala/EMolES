@@ -21,7 +21,7 @@ logging.basicConfig(filename='job_monitor.log', level=logging.INFO, format='%(as
 
 def submit_job(job_folder, cmd_line):
     os.chdir(job_folder)
-    process = subprocess.Popen(cmd_line.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = subprocess.Popen(cmd_line, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return process
 
 
@@ -95,19 +95,13 @@ def local_gaussian(n_parallel_jobs, n_cpu_per_job, db_path, gaussian_key_line, c
                                   chk='gau.chk',
                                   )
             if write_sol_flag:
+                dielectric_constant = a_row.get('dielectric_constant', 0)
                 with open('gau.gjf', "r+") as file:
                     lines = file.readlines()
                     del lines[-1]
                     file.seek(0)
                     file.writelines(lines)
-                    file.writelines(['Eps=18.5\n',
-                                     'EpsInf=1.415\n',
-                                     'HbondAcidity=0\n',
-                                     'HbondBasicity=0.735\n',
-                                     'SurfaceTensionAtInterface=20.2\n',
-                                     'CarbonAromaticity=0\n',
-                                     'ElectronegativeHalogenicity=0\n\n\n',
-                                     ])
+                    file.writelines([f'Eps={dielectric_constant}\n\n\n',])
             job_queue.put(job_folder)
 
     # Dictionary to keep track of active jobs
