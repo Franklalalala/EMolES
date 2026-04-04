@@ -539,7 +539,7 @@ def find_best_dm_transform_permutation(
 
 
 def get_electronic_properties(
-        mol, ham=None, overlap=None, dm=None, shifted_ham=None, pcm_eps=None, mf=None
+        mol, ham=None, overlap=None, dm=None, shifted_ham=None, pcm_eps=1.0, mf=None
 ):
     """
     Helper function to extract electronic properties (Energies, Orbitals, Gap)
@@ -548,6 +548,7 @@ def get_electronic_properties(
     Updated to support PCM solvent model via pcm_eps.
     Now supports passing a pre-initialized PySCF mean-field object (`mf`).
     """
+    from pyscf import dft  # 确保局部有引入
     # 1. 准备 Hamiltonian 和 Overlap
     if ham is None:
         if dm is None:
@@ -558,8 +559,8 @@ def get_electronic_properties(
             mf = dft.RKS(mol)
             mf.xc = "b3lyp"
 
-            # --- Add PCM (Solvent) Model if requested ---
-            if pcm_eps is not None and pcm_eps > 1.0:
+            # --- 优化: 直接判断是否大于 1.0 即可 ---
+            if pcm_eps > 1.0:
                 mf = mf.PCM()
                 mf.with_solvent.eps = pcm_eps
                 mf.with_solvent.method = 'IEF-PCM'
@@ -620,10 +621,8 @@ def get_electronic_properties(
         "shifted_ham": shifted_ham_2d,  # (N, N)
         "density_matrix": dm if dm is not None else make_rdm1(mo_coeff=coeffs, mo_occ=mo_occ),
         "mo_occ": mo_occ,
-        # ================= 更改开始 =================
-        "mo_energy": energies,  # 完整轨道能量，供下游复用
-        "mo_coeff": coeffs,     # 完整轨道系数，供下游复用
-        # ================= 更改结束 =================
+        "mo_energy": energies,
+        "mo_coeff": coeffs,
         "orbital_coefficients": coeffs[:, : homo_idx + 1],
         "HOMO_coefficients": coeffs[:, homo_idx],
         "LUMO_coefficients": coeffs[:, homo_idx + 1],
@@ -631,20 +630,20 @@ def get_electronic_properties(
     }
     return results
 
+
 def calculate_properties_from_dm(
-    mol,
-    dm,
-    prefix,
-    gen_dm_flag: bool = False,
-    # --- 新增: 允许复用上游已经算好的 pyscf 对象 / 矩阵 ---
-    mf=None,
-    fock=None,
-    overlap=None,
-    mo_energy=None,
-    mo_coeff=None,
-    mo_occ=None,
-    xc: str = "b3lyp",
-    pcm_eps: float = None,
+        mol,
+        dm,
+        prefix,
+        gen_dm_flag: bool = False,
+        mf=None,
+        fock=None,
+        overlap=None,
+        mo_energy=None,
+        mo_coeff=None,
+        mo_occ=None,
+        xc: str = "b3lyp",
+        pcm_eps: float = 1.0,  # 优化：默认为真空介电常数 1.0
 ):
     """
     从 density matrix 生成 fchk，并用 Multiwfn 计算:
@@ -670,8 +669,8 @@ def calculate_properties_from_dm(
         mf = dft.RKS(mol)
         mf.xc = xc
 
-        # 可选: 与 get_electronic_properties 保持一致的 PCM（仅当你需要）
-        if pcm_eps is not None and pcm_eps > 1.0:
+        # 优化: 简化判断逻辑
+        if pcm_eps > 1.0:
             mf = mf.PCM()
             mf.with_solvent.eps = pcm_eps
             mf.with_solvent.method = "IEF-PCM"
@@ -681,37 +680,29 @@ def calculate_properties_from_dm(
 
     # ========== 1) overlap / fock / (mo_energy, mo_coeff) ==========
     if overlap is None:
-        # mf.get_ovlp() 通常更稳（如带溶剂模型时），没有就用 intor
         try:
             overlap = mf.get_ovlp()
         except Exception:
             overlap = mol.intor("int1e_ovlp")
 
-    # 规范化维度为 2D
     ov_2d = overlap[0] if (hasattr(overlap, "ndim") and overlap.ndim == 3) else overlap
 
     if (mo_energy is None) or (mo_coeff is None):
-        # 没有 mo 信息时，至少需要 fock
         if fock is None:
-            # 只有在没有上游复用数据时，才会做 get_fock（耗时）
             fock = mf.get_fock(dm=dm)
 
         fock_2d = fock[0] if (hasattr(fock, "ndim") and fock.ndim == 3) else fock
-
-        # 用 pyscf 的 eig 得到 mo_energy/mo_coeff（相对 get_fock 便宜很多）
         mo_energy, mo_coeff = mf.eig(fock_2d, ov_2d)
 
-    # 若未提供 mo_occ，则按闭壳层占据生成（与 get_electronic_properties 逻辑一致）
     if mo_occ is None:
         n_electrons = mol.tot_electrons()
         homo_idx = int(n_electrons / 2) - 1
         mo_occ = get_mo_occ(full_len=len(mo_energy), occ_len=homo_idx + 1)
 
-    # 写 fchk 需要这些字段
     mf.mo_energy = np.array(mo_energy)
     mf.mo_coeff = np.array(mo_coeff)
     mf.mo_occ = np.array(mo_occ)
-    mf.dm = dm  # 保持你原先用法：mokit 侧可能会读取 mf.dm
+    mf.dm = dm
 
     # ========== 2) 生成 fchk ==========
     fch_filename = f"{prefix}.fch"
@@ -778,7 +769,7 @@ def evaluate_dm_from_npy(
         max_items: int = 300,
         gen_esp_cube_flag: bool = False,
         summary_filename="evaluation_summary.npz",
-        pcm_eps: float = 25,
+        pcm_eps: float = 1,  # 外部传入的默认目标溶剂介电常数
         verbose_profiling: bool = False,
 ):
     import time
@@ -819,6 +810,10 @@ def evaluate_dm_from_npy(
         if not os.path.exists(path):
             raise FileNotFoundError(f"Required file not found: {path}")
         return np.load(path)
+
+    # 优化点：在主循环外部只构建一次全局 UFF 半径表，极大减少内部开销
+    if get_ham_flag:
+        global_uff_radii_tb = build_uff_radii_table()
 
     with connect(abs_ase_path) as db:
         for idx, a_row in tqdm(enumerate(db.select())):
@@ -893,55 +888,54 @@ def evaluate_dm_from_npy(
                 t_basic_err = time.time()
                 _log_time(f"[{idx}] [Time] Basic DM & Dipole Metrics:  {t_basic_err - t_mol:.4f} s")
 
-                # 用于写入每个任务 json 的“数值本身”（非 error）
                 electronic_properties_eV = None
-
-                # 2) DM 推导的电子性质 / Ham / 轨道等
                 mf_gas = None
                 pred_props_gas = None
                 target_props_gas = None
 
+                # 2) DM 推导的电子性质 / Ham / 轨道等
                 if get_ham_flag:
-                    current_pcm_eps = a_row.data.get("dielectric_constant", pcm_eps)
+                    # 安全读取 EPS，如果是气相数据或为0/负数，强制规范为 1.0
+                    raw_eps = a_row.data.get("dielectric_constant", pcm_eps)
+                    current_pcm_eps = float(raw_eps) if raw_eps is not None else 1.0
+                    if current_pcm_eps < 1.0:
+                        current_pcm_eps = 1.0
 
-                    # --- 解耦逻辑：分为 GAS (查形状) 和 PCM (查能量) ---
+                    # --- [GAS] 提取本征形貌 ---
                     mf_gas = pyscf.dft.RKS(mol)
                     mf_gas.xc = "b3lyp"
 
-                    mf_pcm = pyscf.dft.RKS(mol)
-                    mf_pcm.xc = "b3lyp"
-                    if current_pcm_eps is not None and current_pcm_eps > 1.0:
-                        mf_pcm = mf_pcm.PCM()
-                        mf_pcm.with_solvent.eps = current_pcm_eps
-                        mf_pcm.with_solvent.method = 'IEF-PCM'
-                        uff_radii_tb = build_uff_radii_table()
-                        mf_pcm.with_solvent.radii_table = 1.1 * uff_radii_tb
-                        mf_pcm.with_solvent.lebedev_order = 31
-
-                    t_mf = time.time()
-                    _log_time(f"[{idx}] [Time] Init Gas & PCM Mean-Fields: {t_mf - t_basic_err:.4f} s")
-
-                    # [GAS] 提取本征形貌
                     pred_props_gas = get_electronic_properties(mol, dm=pred_dm, overlap=overlap, mf=mf_gas)
                     target_props_gas = get_electronic_properties(mol, dm=target_dm, overlap=overlap, mf=mf_gas)
 
-                    # [PCM] 提取微扰能量
-                    pred_props_pcm = get_electronic_properties(
-                        mol, dm=pred_dm, overlap=overlap, pcm_eps=current_pcm_eps, mf=mf_pcm
-                    )
-                    target_props_pcm = get_electronic_properties(
-                        mol, dm=target_dm, overlap=overlap, pcm_eps=current_pcm_eps, mf=mf_pcm
-                    )
+                    t_mf = time.time()
+                    _log_time(f"[{idx}] [Time] Init & Calc Gas Props: {t_mf - t_basic_err:.4f} s")
+
+                    # --- [PCM] 提速核心逻辑优化 ---
+                    if current_pcm_eps > 1.0:
+                        mf_pcm = pyscf.dft.RKS(mol)
+                        mf_pcm.xc = "b3lyp"
+                        mf_pcm = mf_pcm.PCM()
+                        mf_pcm.with_solvent.eps = current_pcm_eps
+                        mf_pcm.with_solvent.method = 'IEF-PCM'
+                        mf_pcm.with_solvent.radii_table = 1.1 * global_uff_radii_tb  # 直接使用外部全局表
+                        mf_pcm.with_solvent.lebedev_order = 31
+
+                        pred_props_pcm = get_electronic_properties(mol, dm=pred_dm, overlap=overlap, mf=mf_pcm)
+                        target_props_pcm = get_electronic_properties(mol, dm=target_dm, overlap=overlap, mf=mf_pcm)
+                    else:
+                        # 若未启用溶剂，直接将 PCM 的引用指向 GAS 结果，彻底避免无意义的重复哈密顿量计算
+                        pred_props_pcm = pred_props_gas
+                        target_props_pcm = target_props_gas
 
                     t_prop = time.time()
-                    _log_time(f"[{idx}] [Time] Get Props (Gas + PCM):      {t_prop - t_mf:.4f} s")
+                    _log_time(f"[{idx}] [Time] Check & Calc PCM Props:     {t_prop - t_mf:.4f} s")
 
                     # Gaussian label (eV)
                     gaussian_homo = a_row.data.get("HOMO_eV", 0.0)
                     gaussian_lumo = a_row.data.get("LUMO_eV", 0.0)
                     gaussian_gap = a_row.data.get("GAP_eV", gaussian_lumo - gaussian_homo)
 
-                    # ======= (需求2) 存“数值本身”，使用 PCM 修正过的能量 =======
                     pred_homo_ev = float(pred_props_pcm["HOMO"]) * Hartree
                     pred_lumo_ev = float(pred_props_pcm["LUMO"]) * Hartree
                     pred_gap_ev = float(pred_props_pcm["GAP"]) * Hartree
@@ -979,6 +973,7 @@ def evaluate_dm_from_npy(
                     errors["ai_pyscf_HOMO"] = abs(pred_homo_ev - pyscf_homo_ev)
                     errors["ai_pyscf_LUMO"] = abs(pred_lumo_ev - pyscf_lumo_ev)
                     errors["ai_pyscf_GAP"] = abs(pred_gap_ev - pyscf_gap_ev)
+
                     # Criterion 对比：必须使用 GAS，避免将 PCM 带来的非物理形变纳入损失评估
                     eval_keys = [
                         "hamiltonian",
@@ -987,7 +982,7 @@ def evaluate_dm_from_npy(
                         "LUMO_coefficients",
                     ]
                     ham_orb_errors = criterion(
-                        pred_props_gas,  # 传入不受微扰的形貌
+                        pred_props_gas,
                         target_props_gas,
                         eval_keys,
                         flag=False,
@@ -1018,21 +1013,21 @@ def evaluate_dm_from_npy(
                         temp_cube_data.append(cube_item)
                 else:
                     t_crit = time.time()
+                    current_pcm_eps = pcm_eps
 
                 # 3) ESP / deformation
                 if get_esp_sta_flag:
-                    # ESP 绝对不能受微扰，必须复用 mf_gas 和其算出的 coeff
                     if get_ham_flag and (pred_props_gas is not None) and (target_props_gas is not None):
                         p_esp_max, p_esp_min, p_phi = calculate_properties_from_dm(
                             mol,
                             pred_dm,
                             "pred",
                             gen_dm_flag=gen_esp_cube_flag,
-                            mf=mf_gas,  # <--- 必须是气相 mf
+                            mf=mf_gas,
                             fock=pred_props_gas.get("hamiltonian", None),
                             overlap=pred_props_gas.get("overlap", overlap),
                             mo_energy=pred_props_gas.get("mo_energy", None),
-                            mo_coeff=pred_props_gas.get("mo_coeff", None),  # <--- 必须是气相 coeff
+                            mo_coeff=pred_props_gas.get("mo_coeff", None),
                             mo_occ=pred_props_gas.get("mo_occ", None),
                         )
                         t_esp_max, t_esp_min, t_phi = calculate_properties_from_dm(
@@ -1085,6 +1080,7 @@ def evaluate_dm_from_npy(
                     "idx": idx,
                     "mol_info": mol_info_log,
                     "errors": errors,
+                    "dielectric_constant_used": current_pcm_eps
                 }
                 if electronic_properties_eV is not None:
                     local_result["electronic_properties_eV"] = electronic_properties_eV
@@ -1144,6 +1140,7 @@ def evaluate_dm_from_npy(
         "Failed Items": fail_count
     })
     return result_dict
+
 
 def get_mae_from_npy(
         abs_ase_path,
