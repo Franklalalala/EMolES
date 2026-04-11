@@ -109,8 +109,7 @@ def generate_cube_files(temp_data_file, n_grid, cube_dump_place, n_max_cubes):
 
 def get_dipole_info(mol, dm):
     mol_dip = dip_moment(mol, dm, unit='DEBYE')
-    dip_magnitude = np.linalg.norm(np.array(mol_dip))
-    return dip_magnitude
+    return np.array(mol_dip, dtype=float)
     # dipole_info = {
     #     'Dipole_Moment_Vector_DEBYE': mol_dip.tolist(),
     #     'Dipole_Moment_Norm_DEBYE': float(dip_magnitude),

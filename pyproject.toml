@@ -45,5 +45,9 @@ dev = [
 "Bug Tracker" = "https://github.com/Franklalalala/EMolES/issues"
 
 [tool.setuptools]
-packages = ["emoles"]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["emoles*"]
 
