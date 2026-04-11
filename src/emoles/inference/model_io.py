@@ -122,10 +122,27 @@ def _resolve_infer_record_key(idx, source_metadata):
     return int(idx)
 
 
+def _normalize_assignment_item(item, fallback_idx):
+    if isinstance(item, dict):
+        source_idx = item.get("source_idx", fallback_idx)
+        source_row_id = item.get("source_row_id", item.get("row_id"))
+        sample_id = item.get("sample_id", source_row_id if source_row_id is not None else source_idx)
+        return int(source_idx), int(source_row_id), sample_id
+
+    if isinstance(item, (list, tuple)) and len(item) >= 2:
+        source_idx = item[0]
+        source_row_id = item[1]
+        sample_id = item[2] if len(item) >= 3 else source_row_id
+        return int(source_idx), int(source_row_id), sample_id
+
+    raise TypeError(f"Unsupported assignment item: {item!r}")
+
+
 def ase_db_2_dummy_dptb_lmdb(
     ase_db_path: str,
     dptb_lmdb_path: str,
     txn_batch_size: int = 128,
+    items=None,
 ):
     if os.path.exists(dptb_lmdb_path):
         shutil.rmtree(dptb_lmdb_path)
@@ -138,9 +155,43 @@ def ase_db_2_dummy_dptb_lmdb(
     txn = lmdb_env.begin(write=True)
     try:
         with connect(ase_db_path) as src_db:
-            for idx, row in enumerate(src_db.select()):
+            if items is None:
+                iterable = (
+                    (idx, row, None)
+                    for idx, row in enumerate(src_db.select())
+                )
+            else:
+                iterable = (
+                    (
+                        local_idx,
+                        src_db.get(id=_normalize_assignment_item(item, local_idx)[1]),
+                        _normalize_assignment_item(item, local_idx),
+                    )
+                    for local_idx, item in enumerate(items)
+                )
+
+            for idx, row, assignment in iterable:
+                if assignment is None:
+                    source_idx = idx
+                    source_row_id = None
+                    sample_id = None
+                else:
+                    source_idx, source_row_id, sample_id = assignment
+                    if row is None:
+                        raise KeyError(
+                            f"ASE row id not found while building DPTB LMDB: {source_row_id}"
+                        )
+
                 an_atoms = row.toatoms()
-                source_metadata = get_row_identifier_payload(row, fallback_idx=idx)
+                source_metadata = get_row_identifier_payload(row, fallback_idx=source_idx)
+                if assignment is not None:
+                    source_metadata.update(
+                        {
+                            "source_idx": int(source_idx),
+                            "source_row_id": int(source_row_id),
+                            "sample_id": sample_id,
+                        }
+                    )
                 source_metadata.update(
                     {
                         "charge": get_row_charge(row, 0),

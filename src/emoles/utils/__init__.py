@@ -21,6 +21,7 @@ try:
     from .db import (
         extract_lmdb_records,
         get_pickle_record_any,
+        prepare_ase_db_worker_assignments,
         prepare_ase_db_worker_shards,
         resolve_lmdb_paths,
         update_ase_db_w_lmdb,
@@ -34,6 +35,11 @@ except ModuleNotFoundError as exc:
     def get_pickle_record_any(*args, **kwargs):
         raise ModuleNotFoundError(
             "get_pickle_record_any requires optional ASE/LMDB dependencies"
+        ) from exc
+
+    def prepare_ase_db_worker_assignments(*args, **kwargs):
+        raise ModuleNotFoundError(
+            "prepare_ase_db_worker_assignments requires optional ASE/LMDB dependencies"
         ) from exc
 
     def prepare_ase_db_worker_shards(*args, **kwargs):
@@ -63,6 +69,7 @@ __all__ = [
     "build_worker_gpu_plan",
     "configure_worker_env",
     "extract_lmdb_records",
+    "prepare_ase_db_worker_assignments",
     "prepare_ase_db_worker_shards",
     "get_pickle_record_any",
     "query_gpu_mem_mb",

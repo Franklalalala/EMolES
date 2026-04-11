@@ -17,12 +17,14 @@ def test_utils_package_preserves_legacy_imports():
         cut_and_cal_matrix,
         format_number,
         get_mo_occ,
+        prepare_ase_db_worker_assignments,
     )
 
     assert format_number(12.345) == "12.35"
     assert format_number(0.01234) == "0.0123"
     assert get_mo_occ(4, 2).tolist() == [2.0, 2.0, 0.0, 0.0]
     assert build_worker_gpu_plan(gpus=[0, 1], workers_per_gpu=2) == [0, 0, 1, 1]
+    assert callable(prepare_ase_db_worker_assignments)
 
     diag_mae, non_diag_mae = cut_and_cal_matrix(
         full_matrix=np.array([[1.0, 2.0], [3.0, 4.0]]),

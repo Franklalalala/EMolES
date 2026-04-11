@@ -111,9 +111,13 @@ def test_lmdb_infer_defaults_and_manifest_contract():
     db_utils_source = db_utils_path.read_text(encoding="utf-8")
     assert 'manifest_path = os.path.join(abs_path, "manifest.json")' in db_utils_source
     assert 'manifest.get("worker_lmdb_paths", [])' in db_utils_source
+    assert "def prepare_ase_db_worker_assignments(" in db_utils_source
 
     parallel_source = parallel_path.read_text(encoding="utf-8")
-    assert "shutil.rmtree(infer_root)" in parallel_source
+    assert "warmup_workers_per_gpu=1" in parallel_source
+    assert "prepare_ase_db_worker_assignments(" in parallel_source
+    assert "_maybe_ramp_up()" in parallel_source
+    assert "run_worker_pool(" not in parallel_source
 
     postprocess_source = (SRC_ROOT / "inference" / "postprocess.py").read_text(encoding="utf-8")
     assert 'DEFAULT_UPDATED_ASE_DB_NAME = "dm_inference_results.db"' in postprocess_source

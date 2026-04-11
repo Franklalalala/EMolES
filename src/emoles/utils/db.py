@@ -284,6 +284,79 @@ def prepare_ase_db_worker_shards(
                 pass
 
 
+def prepare_ase_db_worker_assignments(
+    source_db_path,
+    work_root,
+    n_workers,
+    max_items=None,
+):
+    if os.path.exists(work_root):
+        shutil.rmtree(work_root)
+    os.makedirs(work_root, exist_ok=True)
+
+    worker_specs = []
+    worker_items = []
+    for worker_id in range(int(n_workers)):
+        worker_name = f"worker_{worker_id:02d}"
+        worker_root = os.path.join(work_root, worker_name)
+        os.makedirs(worker_root, exist_ok=True)
+        worker_specs.append(
+            {
+                "worker_id": int(worker_id),
+                "worker_name": worker_name,
+                "worker_root": worker_root,
+                "items_path": os.path.join(worker_root, "items.json"),
+                "num_items": 0,
+                "source_idx_min": None,
+                "source_idx_max": None,
+            }
+        )
+        worker_items.append([])
+
+    with connect(source_db_path) as src_db:
+        total_rows = src_db.count()
+        for source_idx, row in enumerate(src_db.select()):
+            if max_items is not None and source_idx >= int(max_items):
+                break
+
+            worker_id = source_idx % int(n_workers)
+            worker_spec = worker_specs[worker_id]
+            worker_spec["num_items"] += 1
+            if worker_spec["source_idx_min"] is None:
+                worker_spec["source_idx_min"] = int(source_idx)
+            worker_spec["source_idx_max"] = int(source_idx)
+            worker_items[worker_id].append(
+                {
+                    "source_idx": int(source_idx),
+                    "source_row_id": int(row.id),
+                    "sample_id": int(row.id),
+                }
+            )
+
+    final_specs = []
+    for worker_spec, items in zip(worker_specs, worker_items):
+        if worker_spec["num_items"] <= 0:
+            continue
+        with open(worker_spec["items_path"], "w", encoding="utf-8") as f_obj:
+            json.dump(
+                {
+                    "worker_id": worker_spec["worker_id"],
+                    "worker_name": worker_spec["worker_name"],
+                    "num_items": worker_spec["num_items"],
+                    "source_idx_min": worker_spec["source_idx_min"],
+                    "source_idx_max": worker_spec["source_idx_max"],
+                    "total_rows": total_rows,
+                    "max_items": max_items,
+                    "items": items,
+                },
+                f_obj,
+                indent=2,
+            )
+        final_specs.append(worker_spec)
+
+    return final_specs
+
+
 def update_ase_db_w_lmdb(
     src_ase_db_path,
     dump_ase_db_path,
