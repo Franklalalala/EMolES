@@ -98,6 +98,7 @@ def test_lmdb_infer_defaults_and_manifest_contract():
     model_io_path = SRC_ROOT / "inference" / "model_io.py"
     db_utils_path = SRC_ROOT / "utils" / "db.py"
     parallel_path = SRC_ROOT / "inference" / "parallel.py"
+    parallel_utils_path = SRC_ROOT / "utils" / "parallel.py"
 
     direct_defaults = _function_defaults(model_io_path, "dptb_infer_from_ase_db")
     assert direct_defaults.get("max_items") == "None"
@@ -114,10 +115,12 @@ def test_lmdb_infer_defaults_and_manifest_contract():
     assert "def prepare_ase_db_worker_assignments(" in db_utils_source
 
     parallel_source = parallel_path.read_text(encoding="utf-8")
+    parallel_utils_source = parallel_utils_path.read_text(encoding="utf-8")
     assert "warmup_workers_per_gpu=1" in parallel_source
     assert "prepare_ase_db_worker_assignments(" in parallel_source
-    assert "_maybe_ramp_up()" in parallel_source
+    assert "run_ramped_slot_pool(" in parallel_source
     assert "run_worker_pool(" not in parallel_source
+    assert "def run_ramped_slot_pool(" in parallel_utils_source
 
     postprocess_source = (SRC_ROOT / "inference" / "postprocess.py").read_text(encoding="utf-8")
     assert 'DEFAULT_UPDATED_ASE_DB_NAME = "dm_inference_results.db"' in postprocess_source
