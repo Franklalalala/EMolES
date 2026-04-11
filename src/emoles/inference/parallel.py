@@ -1,12 +1,14 @@
 import json
 import os
+import queue as pyqueue
 import shutil
 import time
 import traceback
 
+from ase.db import connect
+
 from emoles.inference.model_io import (
     _build_gamma_projectors,
-    _iter_predicted_batches,
     _prepare_dptb_model,
     _prepare_reference_loader,
     ase_db_2_dummy_dptb_lmdb,
@@ -14,15 +16,11 @@ from emoles.inference.model_io import (
     merge_infer_lmdb_shards,
     save_info_2_lmdb,
 )
-from emoles.utils.db import (
-    open_lmdb_environment,
-    prepare_ase_db_worker_assignments,
-    reset_lmdb_directory,
-)
+from emoles.utils.db import open_lmdb_environment, reset_lmdb_directory
 from emoles.utils.parallel import (
     build_worker_gpu_plan,
     configure_worker_env,
-    run_ramped_slot_pool,
+    run_ase_db_task_queue_pool,
     set_thread_env,
     write_json_file,
 )
@@ -39,239 +37,342 @@ def _count_lmdb_entries(lmdb_path):
         db_env.close()
 
 
-def _count_committed_entries(worker_specs):
-    return sum(_count_lmdb_entries(worker_spec["infer_lmdb_path"]) for worker_spec in worker_specs)
-
-
-def _load_worker_items(items_path):
-    with open(items_path, "r", encoding="utf-8") as f_obj:
+def _read_worker_manifest(shard_path):
+    manifest_path = os.path.join(shard_path, "manifest.json")
+    if not os.path.exists(manifest_path):
+        return {
+            "shard_path": shard_path,
+            "entries": _count_lmdb_entries(shard_path),
+            "status": "ok",
+        }
+    with open(manifest_path, "r", encoding="utf-8") as f_obj:
         payload = json.load(f_obj)
-    return payload.get("items", [])
-
-
-def _strip_worker_spec(worker_spec):
-    return {
-        "worker_id": int(worker_spec["worker_id"]),
-        "worker_name": worker_spec["worker_name"],
-        "worker_root": worker_spec["worker_root"],
-        "items_path": worker_spec["items_path"],
-        "num_items": int(worker_spec["num_items"]),
-        "source_idx_min": worker_spec.get("source_idx_min"),
-        "source_idx_max": worker_spec.get("source_idx_max"),
-        "gpu_id": worker_spec.get("gpu_id"),
-        "infer_lmdb_path": worker_spec["infer_lmdb_path"],
-        "input_lmdb_root": worker_spec["input_lmdb_root"],
-    }
-
-
-def _worker_manifest_payload(worker_spec, device_name, basis, r_max, entries, second_per_item):
-    return {
-        "ase_db_path": worker_spec["ase_db_path"],
-        "checkpoint_path": worker_spec["checkpoint_path"],
-        "device": device_name,
-        "entries": int(entries),
-        "worker_name": worker_spec["worker_name"],
-        "shard_path": worker_spec["infer_lmdb_path"],
-        "infer_root": worker_spec["infer_root"],
-        "has_overlap": bool(worker_spec["has_overlap"]),
-        "basis": basis,
-        "r_max": r_max,
-        "second_per_item": float(second_per_item),
-        "items_path": worker_spec["items_path"],
-        "cleanup_input_lmdb": bool(worker_spec["cleanup_input_lmdb"]),
-        "key_field": "source_row_id",
-    }
-
-
-def _slot_failure_result(worker_spec, error, exitcode=None):
-    payload = {
-        "worker_id": int(worker_spec["worker_id"]),
-        "gpu_id": worker_spec.get("gpu_id"),
-        "status": "error",
-        "error": str(error),
-    }
-    if exitcode is not None:
-        payload["exitcode"] = exitcode
+    payload.setdefault("status", "ok")
     return payload
 
 
-def _spawn_dptb_slot_process(
+def _worker_manifest_payload(
+    *,
+    ase_db_path,
+    checkpoint_path,
+    device_name,
+    entries,
+    worker_name,
+    shard_path,
+    infer_root,
+    has_overlap,
+    basis,
+    r_max,
+    second_per_item,
+    key_field="source_row_id",
+):
+    return {
+        "ase_db_path": ase_db_path,
+        "checkpoint_path": os.path.abspath(checkpoint_path),
+        "device": device_name,
+        "entries": int(entries),
+        "worker_name": worker_name,
+        "shard_path": shard_path,
+        "infer_root": infer_root,
+        "has_overlap": bool(has_overlap),
+        "basis": basis,
+        "r_max": r_max,
+        "second_per_item": float(second_per_item),
+        "key_field": key_field,
+    }
+
+
+def _spawn_dptb_worker(
     *,
     slot_id,
     attempt,
-    result_queue,
+    gpu_id,
     ctx,
-    worker_specs,
+    task_queue,
+    result_queue,
+    stop_event,
+    worker_root,
+    ase_db_path,
+    checkpoint_path,
+    infer_root,
+    has_overlap,
     cpu_threads_per_worker,
+    txn_batch_size,
+    cleanup_input_lmdb,
 ):
+    worker_name = f"slot_{slot_id:03d}__a{attempt:04d}"
+    shard_path = os.path.join(infer_root, f"{worker_name}.lmdb")
+    input_lmdb_root = os.path.join(worker_root, f"{worker_name}_input")
     proc = ctx.Process(
-        target=_run_dptb_slot_worker,
+        target=_run_dptb_queue_worker,
         args=(
             slot_id,
             attempt,
-            worker_specs[slot_id],
+            gpu_id,
+            {
+                "ase_db_path": ase_db_path,
+                "checkpoint_path": checkpoint_path,
+                "infer_root": infer_root,
+                "infer_lmdb_path": shard_path,
+                "input_lmdb_root": input_lmdb_root,
+                "worker_name": worker_name,
+                "has_overlap": bool(has_overlap),
+                "txn_batch_size": int(txn_batch_size),
+                "cleanup_input_lmdb": bool(cleanup_input_lmdb),
+            },
             cpu_threads_per_worker,
+            task_queue,
             result_queue,
+            stop_event,
         ),
     )
     proc.start()
-    return proc
+    return proc, shard_path
 
 
-def _run_dptb_slot_worker(slot_id, attempt, worker_spec, cpu_threads_per_worker, result_queue):
+def _run_dptb_queue_worker(
+    slot_id,
+    attempt,
+    gpu_id,
+    worker_spec,
+    cpu_threads_per_worker,
+    task_queue,
+    result_queue,
+    stop_event,
+):
     pid = os.getpid()
-    gpu_id = worker_spec.get("gpu_id")
     logical_device = "cpu" if gpu_id is None else "cuda"
     device_name = "cpu" if gpu_id is None else f"cuda:{gpu_id}"
-    log_path = os.path.join(worker_spec["worker_root"], "worker.log")
+    shard_path = worker_spec["infer_lmdb_path"]
+    input_root = worker_spec["input_lmdb_root"]
 
-    with open(log_path, "a", encoding="utf-8") as log_file:
-        def _log(message):
-            line = str(message)
-            print(line)
-            log_file.write(line + "\n")
-            log_file.flush()
+    try:
+        configure_worker_env(gpu_id=gpu_id, cpu_threads_per_worker=cpu_threads_per_worker)
 
+        init_start = time.time()
+        model, device, basis, r_max = _prepare_dptb_model(
+            checkpoint_path=worker_spec["checkpoint_path"],
+            device=logical_device,
+        )
+        projectors = _build_gamma_projectors(
+            model=model,
+            device=device,
+            has_overlap=worker_spec["has_overlap"],
+        )
+        init_s = time.time() - init_start
+
+        mem_alloc_mb, mem_reserved_mb = None, None
         try:
-            configure_worker_env(
-                gpu_id=gpu_id,
-                cpu_threads_per_worker=cpu_threads_per_worker,
-            )
+            import torch
 
-            init_start = time.time()
-            model, device, basis, r_max = _prepare_dptb_model(
-                checkpoint_path=worker_spec["checkpoint_path"],
-                device=logical_device,
-            )
-            projectors = _build_gamma_projectors(
-                model=model,
-                device=device,
-                has_overlap=worker_spec["has_overlap"],
-            )
-            init_s = time.time() - init_start
+            if gpu_id is not None and torch.cuda.is_available():
+                mem_alloc_mb = int(torch.cuda.memory_allocated() / 1024 / 1024)
+                mem_reserved_mb = int(torch.cuda.memory_reserved() / 1024 / 1024)
+        except Exception:
+            pass
 
-            result_queue.put(
-                {
-                    "type": "worker_ready",
-                    "slot_id": int(slot_id),
-                    "attempt": int(attempt),
-                    "pid": int(pid),
-                    "device": device_name,
-                    "worker_name": worker_spec["worker_name"],
-                    "init_s": float(init_s),
-                    "num_items": int(worker_spec["num_items"]),
-                }
-            )
-            _log(
-                f"[READY][{device_name}][S{slot_id:03d}] "
-                f"attempt={attempt} init_s={init_s:.1f} items={worker_spec['num_items']}"
-            )
+        result_queue.put(
+            {
+                "type": "worker_ready",
+                "slot_id": int(slot_id),
+                "attempt": int(attempt),
+                "pid": int(pid),
+                "device": device_name,
+                "worker_db": shard_path,
+                "init_s": float(init_s),
+                "mem_alloc_mb": mem_alloc_mb,
+                "mem_reserved_mb": mem_reserved_mb,
+            }
+        )
+    except Exception as exc:
+        result_queue.put(
+            {
+                "type": "worker_fatal",
+                "stage": "init",
+                "slot_id": int(slot_id),
+                "attempt": int(attempt),
+                "pid": int(pid),
+                "device": device_name,
+                "error": f"Model init failed: {exc}",
+                "traceback": traceback.format_exc(),
+            }
+        )
+        return
 
-            items = _load_worker_items(worker_spec["items_path"])
-            input_records = ase_db_2_dummy_dptb_lmdb(
+    reset_lmdb_directory(shard_path)
+    output_env = open_lmdb_environment(shard_path)
+    txn = output_env.begin(write=True)
+    processed_items = 0
+    infer_start = time.time()
+
+    try:
+        with connect(worker_spec["ase_db_path"]) as src_db:
+            while True:
+                try:
+                    row_id = task_queue.get(timeout=1.0)
+                except pyqueue.Empty:
+                    if stop_event.is_set():
+                        break
+                    continue
+
+                if row_id is None:
+                    break
+
+                row_id = int(row_id)
+                row = src_db.get(id=row_id)
+                if row is None:
+                    result_queue.put(
+                        {
+                            "type": "error",
+                            "slot_id": int(slot_id),
+                            "attempt": int(attempt),
+                            "pid": int(pid),
+                            "device": device_name,
+                            "row_id": row_id,
+                            "name": f"id_{row_id:06d}",
+                            "error": f"ASE row id not found: {row_id}",
+                            "traceback": "",
+                        }
+                    )
+                    continue
+
+                safe_name = f"id_{row_id:06d}"
+                temp_input_root = os.path.join(input_root, safe_name)
+                try:
+                    input_records = ase_db_2_dummy_dptb_lmdb(
+                        ase_db_path=worker_spec["ase_db_path"],
+                        dptb_lmdb_path=temp_input_root,
+                        txn_batch_size=1,
+                        items=[
+                            {
+                                "source_idx": row_id,
+                                "source_row_id": row_id,
+                                "sample_id": row_id,
+                            }
+                        ],
+                    )
+                    reference_loader = _prepare_reference_loader(
+                        lmdb_path=temp_input_root,
+                        basis=basis,
+                        r_max=r_max,
+                    )
+
+                    for idx, ref_batch in enumerate(reference_loader):
+                        from dptb.data import AtomicData
+                        import torch
+
+                        source_metadata = input_records[idx]
+                        result_queue.put(
+                            {
+                                "type": "started",
+                                "slot_id": int(slot_id),
+                                "attempt": int(attempt),
+                                "pid": int(pid),
+                                "device": device_name,
+                                "row_id": int(source_metadata["source_row_id"]),
+                                "name": safe_name,
+                            }
+                        )
+                        batch = AtomicData.to_AtomicDataDict(ref_batch.to(device))
+                        with torch.no_grad():
+                            predicted_data = model(batch)
+                        save_info_2_lmdb(
+                            txn=txn,
+                            idx=processed_items,
+                            source_metadata=source_metadata,
+                            batch_info=predicted_data,
+                            model=model,
+                            device=device,
+                            has_overlap=worker_spec["has_overlap"],
+                            projectors=projectors,
+                        )
+                        processed_items += 1
+                        if processed_items % max(1, int(worker_spec["txn_batch_size"])) == 0:
+                            txn.commit()
+                            txn = output_env.begin(write=True)
+                        result_queue.put(
+                            {
+                                "type": "done",
+                                "slot_id": int(slot_id),
+                                "attempt": int(attempt),
+                                "pid": int(pid),
+                                "device": device_name,
+                                "row_id": int(source_metadata["source_row_id"]),
+                                "name": safe_name,
+                            }
+                        )
+                except Exception as exc:
+                    result_queue.put(
+                        {
+                            "type": "error",
+                            "slot_id": int(slot_id),
+                            "attempt": int(attempt),
+                            "pid": int(pid),
+                            "device": device_name,
+                            "row_id": row_id,
+                            "name": safe_name,
+                            "error": str(exc),
+                            "traceback": traceback.format_exc(),
+                        }
+                    )
+                finally:
+                    if os.path.exists(temp_input_root):
+                        shutil.rmtree(temp_input_root, ignore_errors=True)
+
+        txn.commit()
+        write_json_file(
+            os.path.join(shard_path, "manifest.json"),
+            _worker_manifest_payload(
                 ase_db_path=worker_spec["ase_db_path"],
-                dptb_lmdb_path=worker_spec["input_lmdb_root"],
-                txn_batch_size=worker_spec["input_txn_batch_size"],
-                items=items,
-            )
-            reference_loader = _prepare_reference_loader(
-                lmdb_path=worker_spec["input_lmdb_root"],
+                checkpoint_path=worker_spec["checkpoint_path"],
+                device_name=device_name,
+                entries=processed_items,
+                worker_name=worker_spec["worker_name"],
+                shard_path=shard_path,
+                infer_root=worker_spec["infer_root"],
+                has_overlap=worker_spec["has_overlap"],
                 basis=basis,
                 r_max=r_max,
-            )
+                second_per_item=(time.time() - infer_start) / max(1, processed_items),
+            ),
+        )
+    except Exception as exc:
+        txn.abort()
+        result_queue.put(
+            {
+                "type": "worker_fatal",
+                "stage": "run",
+                "slot_id": int(slot_id),
+                "attempt": int(attempt),
+                "pid": int(pid),
+                "device": device_name,
+                "error": f"Worker crashed: {exc}",
+                "traceback": traceback.format_exc(),
+            }
+        )
+    finally:
+        output_env.close()
+        if worker_spec["cleanup_input_lmdb"] and os.path.exists(input_root):
+            shutil.rmtree(input_root, ignore_errors=True)
+        try:
+            import torch
 
-            reset_lmdb_directory(worker_spec["infer_lmdb_path"])
-            output_env = open_lmdb_environment(worker_spec["infer_lmdb_path"])
-            processed_items = 0
-            infer_start = time.time()
-            txn = output_env.begin(write=True)
-            try:
-                for idx, predicted_data in _iter_predicted_batches(
-                    reference_loader=reference_loader,
-                    model=model,
-                    device=device,
-                    max_items=None,
-                ):
-                    source_metadata = (
-                        input_records[idx]
-                        if idx < len(input_records)
-                        else {"source_idx": idx, "source_row_id": None, "sample_id": idx}
-                    )
-                    save_info_2_lmdb(
-                        txn=txn,
-                        idx=idx,
-                        source_metadata=source_metadata,
-                        batch_info=predicted_data,
-                        model=model,
-                        device=device,
-                        has_overlap=worker_spec["has_overlap"],
-                        projectors=projectors,
-                    )
-                    processed_items += 1
-                    if processed_items % max(1, int(worker_spec["txn_batch_size"])) == 0:
-                        txn.commit()
-                        txn = output_env.begin(write=True)
-                txn.commit()
-            except Exception:
-                txn.abort()
-                raise
-            finally:
-                output_env.close()
-
-            if worker_spec["cleanup_input_lmdb"] and os.path.exists(worker_spec["input_lmdb_root"]):
-                shutil.rmtree(worker_spec["input_lmdb_root"])
-
-            second_per_item = (time.time() - infer_start) / max(1, processed_items)
-            write_json_file(
-                os.path.join(worker_spec["infer_lmdb_path"], "manifest.json"),
-                _worker_manifest_payload(
-                    worker_spec=worker_spec,
-                    device_name=device_name,
-                    basis=basis,
-                    r_max=r_max,
-                    entries=processed_items,
-                    second_per_item=second_per_item,
-                ),
-            )
+            if gpu_id is not None and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
             result_queue.put(
                 {
-                    "type": "worker_done",
+                    "type": "worker_exit",
                     "slot_id": int(slot_id),
                     "attempt": int(attempt),
                     "pid": int(pid),
                     "device": device_name,
-                    "worker_name": worker_spec["worker_name"],
-                    "entries": int(processed_items),
-                    "second_per_item": float(second_per_item),
                 }
             )
-            _log(
-                f"[DONE ][{device_name}][S{slot_id:03d}] "
-                f"attempt={attempt} entries={processed_items} second_per_item={second_per_item:.4f}"
-            )
-        except Exception as exc:
-            _log(f"[FATAL][{device_name}][S{slot_id:03d}] {exc!r}")
-            _log(traceback.format_exc())
-            result_queue.put(
-                {
-                    "type": "worker_fatal",
-                    "slot_id": int(slot_id),
-                    "attempt": int(attempt),
-                    "pid": int(pid),
-                    "device": device_name,
-                    "worker_name": worker_spec["worker_name"],
-                    "error": repr(exc),
-                    "traceback": traceback.format_exc(),
-                }
-            )
-        finally:
-            try:
-                import torch
-
-                if gpu_id is not None and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
+        except Exception:
+            pass
 
 
 def dptb_infer_to_lmdb_from_ase_db_pll(
@@ -304,6 +405,7 @@ def dptb_infer_to_lmdb_from_ase_db_pll(
     show_progress=True,
     verbose=False,
 ):
+    del progress_scan_interval_sec
     if limit is not None:
         max_items = limit
 
@@ -324,23 +426,11 @@ def dptb_infer_to_lmdb_from_ase_db_pll(
     os.makedirs(infer_root, exist_ok=True)
     os.makedirs(input_root, exist_ok=True)
 
-    gpu_plan = build_worker_gpu_plan(
-        device=device,
-        gpus=gpus,
-        workers_per_gpu=workers_per_gpu,
-        cpu_workers=cpu_workers,
-    )
-    n_workers = len(gpu_plan)
-    if n_workers <= 0:
-        raise ValueError("No workers configured")
-
-    worker_specs = prepare_ase_db_worker_assignments(
-        source_db_path=ase_db_path,
-        work_root=pll_work_root,
-        n_workers=n_workers,
-        max_items=max_items,
-    )
-    if not worker_specs:
+    with connect(ase_db_path) as src_db:
+        total_rows = src_db.count()
+    if max_items is not None:
+        total_rows = min(int(total_rows), int(max_items))
+    if total_rows <= 0:
         summary = {
             "infer_root": infer_root,
             "merged_path": None,
@@ -361,30 +451,19 @@ def dptb_infer_to_lmdb_from_ase_db_pll(
         )
         return summary
 
-    gpu_plan = gpu_plan[: len(worker_specs)]
-    for worker_spec, gpu_id in zip(worker_specs, gpu_plan):
-        worker_spec["gpu_id"] = gpu_id
-        worker_spec["ase_db_path"] = ase_db_path
-        worker_spec["checkpoint_path"] = checkpoint_path
-        worker_spec["infer_root"] = infer_root
-        worker_spec["infer_lmdb_path"] = os.path.join(
-            infer_root,
-            f"{worker_spec['worker_name']}.lmdb",
-        )
-        worker_spec["input_lmdb_root"] = os.path.join(
-            input_root,
-            worker_spec["worker_name"],
-        )
-        worker_spec["has_overlap"] = bool(has_overlap)
-        worker_spec["txn_batch_size"] = int(txn_batch_size)
-        worker_spec["input_txn_batch_size"] = max(32, int(txn_batch_size))
-        worker_spec["cleanup_input_lmdb"] = bool(cleanup_input_lmdb)
+    worker_gpu_plan = build_worker_gpu_plan(
+        device=device,
+        gpus=gpus,
+        workers_per_gpu=workers_per_gpu,
+        cpu_workers=cpu_workers,
+    )
+    if not worker_gpu_plan:
+        raise ValueError("No workers configured")
 
     if cpu_threads_per_worker is None:
         ncpu = os.cpu_count() or 1
-        cpu_threads_per_worker = max(1, ncpu // max(1, len(worker_specs)))
+        cpu_threads_per_worker = max(1, ncpu // max(1, len(worker_gpu_plan)))
     set_thread_env(cpu_threads_per_worker)
-
     os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
 
     write_json_file(
@@ -409,45 +488,39 @@ def dptb_infer_to_lmdb_from_ase_db_pll(
             "global_init_concurrency": int(global_init_concurrency),
             "init_concurrency_per_gpu": int(init_concurrency_per_gpu),
             "max_restarts_per_slot": int(max_restarts_per_slot),
-            "worker_specs": [_strip_worker_spec(worker_spec) for worker_spec in worker_specs],
         },
     )
 
-    total_items = sum(int(worker_spec["num_items"]) for worker_spec in worker_specs)
-    def _spawn_process(slot_id, attempt, result_queue, ctx):
-        return _spawn_dptb_slot_process(
+    def _spawn_worker(slot_id, attempt, gpu_id, ctx, task_queue, result_queue, stop_event):
+        return _spawn_dptb_worker(
             slot_id=slot_id,
             attempt=attempt,
-            result_queue=result_queue,
+            gpu_id=gpu_id,
             ctx=ctx,
-            worker_specs=worker_specs,
+            task_queue=task_queue,
+            result_queue=result_queue,
+            stop_event=stop_event,
+            worker_root=input_root,
+            ase_db_path=ase_db_path,
+            checkpoint_path=checkpoint_path,
+            infer_root=infer_root,
+            has_overlap=has_overlap,
             cpu_threads_per_worker=cpu_threads_per_worker,
+            txn_batch_size=txn_batch_size,
+            cleanup_input_lmdb=cleanup_input_lmdb,
         )
 
-    def _make_done_result(slot_id, msg):
-        return {
-            "worker_id": int(worker_specs[slot_id]["worker_id"]),
-            "gpu_id": worker_specs[slot_id].get("gpu_id"),
-            "status": "ok",
-            "entries": int(msg["entries"]),
-            "second_per_item": float(msg["second_per_item"]),
-        }
-
-    def _make_failure_result(slot_id, error, exitcode=None):
-        return _slot_failure_result(
-            worker_specs[slot_id],
-            error,
-            exitcode=exitcode,
-        )
-
-    results = run_ramped_slot_pool(
-        worker_specs=worker_specs,
-        spawn_process=_spawn_process,
-        make_done_result=_make_done_result,
-        make_failure_result=_make_failure_result,
-        device=device,
-        workers_per_gpu=workers_per_gpu,
+    run_state = run_ase_db_task_queue_pool(
+        input_db=ase_db_path,
+        total_tasks=total_rows,
+        worker_gpu_plan=worker_gpu_plan,
+        spawn_worker=_spawn_worker,
+        failure_log_path=os.path.join(pll_work_root, "failed_jobs.log"),
+        progress_desc="DPTB PLL Infer",
+        show_progress=show_progress,
+        verbose=verbose,
         warmup_workers_per_gpu=warmup_workers_per_gpu,
+        workers_per_gpu=workers_per_gpu,
         ramp_step_per_gpu=ramp_step_per_gpu,
         ramp_interval_sec=ramp_interval_sec,
         stable_window_sec=stable_window_sec,
@@ -457,22 +530,24 @@ def dptb_infer_to_lmdb_from_ase_db_pll(
         global_init_concurrency=global_init_concurrency,
         init_concurrency_per_gpu=init_concurrency_per_gpu,
         max_restarts_per_slot=max_restarts_per_slot,
-        progress_total=total_items,
-        progress_desc="DPTB PLL Infer",
-        progress_scan_interval_sec=progress_scan_interval_sec,
-        progress_scanner=lambda: _count_committed_entries(worker_specs),
-        show_progress=show_progress,
-        verbose=verbose,
+        max_items=max_items,
     )
 
-    write_json_file(
-        os.path.join(pll_work_root, "worker_results.json"),
-        {"results": results},
-    )
+    worker_lmdb_paths = list(dict.fromkeys(run_state["spawn_artifacts"]))
+    results = [_read_worker_manifest(path) for path in worker_lmdb_paths if os.path.exists(path)]
+    write_json_file(os.path.join(pll_work_root, "worker_results.json"), {"results": results})
 
-    failures = [result for result in results if result.get("status") != "ok"]
+    failures = list(run_state["fail_ids"])
     if failures:
-        raise RuntimeError(json.dumps({"worker_failures": failures}, indent=2))
+        raise RuntimeError(
+            json.dumps(
+                {
+                    "failed_rows": failures,
+                    "failed_log_path": os.path.join(pll_work_root, "failed_jobs.log"),
+                },
+                indent=2,
+            )
+        )
 
     merged_path = None
     if merge_shards:
@@ -481,8 +556,8 @@ def dptb_infer_to_lmdb_from_ase_db_pll(
     summary = {
         "infer_root": infer_root,
         "merged_path": merged_path,
-        "workers": len(worker_specs),
-        "worker_lmdb_paths": [worker_spec["infer_lmdb_path"] for worker_spec in worker_specs],
+        "workers": len(worker_gpu_plan),
+        "worker_lmdb_paths": worker_lmdb_paths,
         "results": results,
     }
     write_json_file(os.path.join(pll_work_root, "summary.json"), summary)
@@ -491,8 +566,8 @@ def dptb_infer_to_lmdb_from_ase_db_pll(
         {
             "infer_root": infer_root,
             "merged_path": merged_path,
-            "worker_lmdb_paths": [worker_spec["infer_lmdb_path"] for worker_spec in worker_specs],
-            "workers": len(worker_specs),
+            "worker_lmdb_paths": worker_lmdb_paths,
+            "workers": len(worker_gpu_plan),
             "key_field": "source_row_id",
         },
     )
