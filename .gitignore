@@ -1,6 +1,7 @@
 # Temporary and binary files
 *~
 *.py[cod]
+*.pyc.*
 *.so
 *.cfg
 !.isort.cfg
@@ -8,11 +9,13 @@
 *.orig
 *.log
 *.pot
+__pycache__/
 __pycache__/*
 .cache/*
 .*.swp
 */.ipynb_checkpoints/*
 .DS_Store
+tmp*/
 
 # Project files
 .ropeproject
