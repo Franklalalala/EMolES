@@ -90,7 +90,7 @@ def test_dptb_pll_worker_builds_single_input_lmdb_per_worker(tmp_path, monkeypat
     sys.modules.pop("emoles.inference.model_io", None)
     sys.modules.pop("emoles.inference.dptb_pll", None)
 
-    dptb_pll = importlib.import_module("emoles.inference.dptb_pll")
+    model_io = importlib.import_module("emoles.inference.model_io")
 
     db_path = tmp_path / "tiny.db"
     with connect(db_path) as db:
@@ -176,20 +176,20 @@ def test_dptb_pll_worker_builds_single_input_lmdb_per_worker(tmp_path, monkeypat
         def close(self):
             return None
 
-    monkeypatch.setattr(dptb_pll, "_prepare_dptb_model", _fake_prepare_model)
-    monkeypatch.setattr(dptb_pll, "_build_gamma_projectors", _fake_build_projectors)
-    monkeypatch.setattr(dptb_pll, "ase_db_2_dummy_dptb_lmdb", _fake_ase_db_to_lmdb)
-    monkeypatch.setattr(dptb_pll, "_prepare_reference_loader", _fake_prepare_loader)
-    monkeypatch.setattr(dptb_pll, "_iter_predicted_batches", _fake_iter_batches)
-    monkeypatch.setattr(dptb_pll, "save_info_2_lmdb", _fake_save_info)
-    monkeypatch.setattr(dptb_pll, "configure_worker_env", lambda gpu_id=None, cpu_threads_per_worker=None: None)
+    monkeypatch.setattr(model_io, "_prepare_dptb_model", _fake_prepare_model)
+    monkeypatch.setattr(model_io, "_build_gamma_projectors", _fake_build_projectors)
+    monkeypatch.setattr(model_io, "ase_db_2_dummy_dptb_lmdb", _fake_ase_db_to_lmdb)
+    monkeypatch.setattr(model_io, "_prepare_reference_loader", _fake_prepare_loader)
+    monkeypatch.setattr(model_io, "_iter_predicted_batches", _fake_iter_batches)
+    monkeypatch.setattr(model_io, "save_info_2_lmdb", _fake_save_info)
+    monkeypatch.setattr(model_io, "configure_worker_env", lambda gpu_id=None, cpu_threads_per_worker=None: None)
     monkeypatch.setattr(
-        dptb_pll,
+        model_io,
         "reset_lmdb_directory",
         lambda path: Path(path).mkdir(parents=True, exist_ok=True),
     )
     monkeypatch.setattr(
-        dptb_pll,
+        model_io,
         "open_lmdb_environment",
         lambda path, readonly=False: _FakeEnv(path),
     )
@@ -213,7 +213,7 @@ def test_dptb_pll_worker_builds_single_input_lmdb_per_worker(tmp_path, monkeypat
     }
 
     result_queue = queue.Queue()
-    dptb_pll._run_dptb_slot_worker(
+    model_io.run_dptb_slot_worker(
         slot_id=0,
         attempt=0,
         worker_spec=worker_spec,

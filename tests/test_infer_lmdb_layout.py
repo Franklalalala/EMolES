@@ -111,11 +111,14 @@ def test_lmdb_infer_defaults_and_manifest_contract():
 
     model_io_source = model_io_path.read_text(encoding="utf-8")
     assert 'os.path.join(infer_root, "manifest.json")' in model_io_source
+    assert "def run_dptb_slot_worker(" in model_io_source
+    assert "def populate_dptb_worker_specs(" in model_io_source
 
     db_utils_source = db_utils_path.read_text(encoding="utf-8")
     assert 'manifest_path = os.path.join(abs_path, "manifest.json")' in db_utils_source
     assert 'manifest.get("worker_lmdb_paths", [])' in db_utils_source
     assert "def prepare_ase_db_worker_assignments(" in db_utils_source
+    assert "def load_worker_assignment_items(" in db_utils_source
 
     parallel_source = parallel_path.read_text(encoding="utf-8")
     dptb_pll_source = dptb_pll_path.read_text(encoding="utf-8")
@@ -123,8 +126,8 @@ def test_lmdb_infer_defaults_and_manifest_contract():
     uma_parallel_source = uma_parallel_path.read_text(encoding="utf-8")
     assert 'from emoles.inference.dptb_pll import dptb_infer_to_lmdb_from_ase_db_pll' in parallel_source
     assert "warmup_workers_per_gpu=1" in dptb_pll_source
-    assert 'worker_spec["input_lmdb_root"] = os.path.join(' in dptb_pll_source
-    assert "items = _load_worker_items(worker_spec[\"items_path\"])" in dptb_pll_source
+    assert "populate_dptb_worker_specs(" in dptb_pll_source
+    assert "spawn_dptb_slot_process(" in dptb_pll_source
     assert "run_ramped_slot_pool(" in dptb_pll_source
     assert "def run_ase_db_task_queue_pool(" in parallel_utils_source
     assert "def run_ramped_slot_pool(" in parallel_utils_source

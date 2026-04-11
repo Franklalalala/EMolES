@@ -76,6 +76,23 @@ def iter_lmdb_records(lmdb_path):
         db_env.close()
 
 
+def count_lmdb_entries(lmdb_path):
+    if not os.path.isdir(lmdb_path):
+        return 0
+    db_env = open_lmdb_environment(lmdb_path, readonly=True)
+    try:
+        with db_env.begin() as txn:
+            return int(txn.stat()["entries"])
+    finally:
+        db_env.close()
+
+
+def load_worker_assignment_items(items_path):
+    with open(items_path, "r", encoding="utf-8") as f_obj:
+        payload = json.load(f_obj)
+    return payload.get("items", [])
+
+
 def resolve_lmdb_paths(lmdb_root_or_path, prefer_merged=True):
     abs_path = os.path.abspath(lmdb_root_or_path)
     if abs_path.endswith(".lmdb"):
