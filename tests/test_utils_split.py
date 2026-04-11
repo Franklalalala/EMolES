@@ -20,6 +20,7 @@ def test_utils_package_preserves_legacy_imports():
         get_mo_occ,
         prepare_ase_db_worker_assignments,
         run_ase_db_task_queue_pool,
+        run_ramped_slot_pool,
     )
 
     assert format_number(12.345) == "12.35"
@@ -29,6 +30,7 @@ def test_utils_package_preserves_legacy_imports():
     assert callable(prepare_ase_db_worker_assignments)
     assert callable(feed_ase_db_task_queue)
     assert callable(run_ase_db_task_queue_pool)
+    assert callable(run_ramped_slot_pool)
 
     diag_mae, non_diag_mae = cut_and_cal_matrix(
         full_matrix=np.array([[1.0, 2.0], [3.0, 4.0]]),

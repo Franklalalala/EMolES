@@ -8,7 +8,7 @@ from emoles.inference.model_io import (
     save_info_2_lmdb,
     save_info_2_npy,
 )
-from emoles.inference.parallel import dptb_infer_to_lmdb_from_ase_db_pll
+from emoles.inference.dptb_pll import dptb_infer_to_lmdb_from_ase_db_pll
 from emoles.inference.common_tools import load_npy_safe as _load_npy_safe
 
 

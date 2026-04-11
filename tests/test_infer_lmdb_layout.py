@@ -55,6 +55,7 @@ def test_lmdb_infer_modules_compile():
         SRC_ROOT / "hpc" / "__init__.py",
         SRC_ROOT / "hpc" / "dm_infer.py",
         SRC_ROOT / "hpc" / "utils.py",
+        SRC_ROOT / "inference" / "dptb_pll.py",
         SRC_ROOT / "inference" / "model_io.py",
         SRC_ROOT / "inference" / "parallel.py",
         SRC_ROOT / "inference" / "infer_entry.py",
@@ -68,7 +69,7 @@ def test_lmdb_infer_api_is_exposed():
     assert "dptb_infer_to_lmdb_from_ase_db" in model_io_defs
     assert "merge_infer_lmdb_shards" in model_io_defs
 
-    pll_defs = _top_level_defs(SRC_ROOT / "inference" / "parallel.py")
+    pll_defs = _top_level_defs(SRC_ROOT / "inference" / "dptb_pll.py")
     assert "dptb_infer_to_lmdb_from_ase_db_pll" in pll_defs
 
     postprocess_defs = _top_level_defs(SRC_ROOT / "inference" / "postprocess.py")
@@ -98,6 +99,7 @@ def test_lmdb_infer_defaults_and_manifest_contract():
     model_io_path = SRC_ROOT / "inference" / "model_io.py"
     db_utils_path = SRC_ROOT / "utils" / "db.py"
     parallel_path = SRC_ROOT / "inference" / "parallel.py"
+    dptb_pll_path = SRC_ROOT / "inference" / "dptb_pll.py"
     parallel_utils_path = SRC_ROOT / "utils" / "parallel.py"
     uma_parallel_path = SRC_ROOT / "build" / "uma_parallel.py"
 
@@ -116,12 +118,16 @@ def test_lmdb_infer_defaults_and_manifest_contract():
     assert "def prepare_ase_db_worker_assignments(" in db_utils_source
 
     parallel_source = parallel_path.read_text(encoding="utf-8")
+    dptb_pll_source = dptb_pll_path.read_text(encoding="utf-8")
     parallel_utils_source = parallel_utils_path.read_text(encoding="utf-8")
     uma_parallel_source = uma_parallel_path.read_text(encoding="utf-8")
-    assert "warmup_workers_per_gpu=1" in parallel_source
-    assert "run_ase_db_task_queue_pool(" in parallel_source
-    assert "run_worker_pool(" not in parallel_source
+    assert 'from emoles.inference.dptb_pll import dptb_infer_to_lmdb_from_ase_db_pll' in parallel_source
+    assert "warmup_workers_per_gpu=1" in dptb_pll_source
+    assert 'worker_spec["input_lmdb_root"] = os.path.join(' in dptb_pll_source
+    assert "items = _load_worker_items(worker_spec[\"items_path\"])" in dptb_pll_source
+    assert "run_ramped_slot_pool(" in dptb_pll_source
     assert "def run_ase_db_task_queue_pool(" in parallel_utils_source
+    assert "def run_ramped_slot_pool(" in parallel_utils_source
     assert "def feed_ase_db_task_queue(" in parallel_utils_source
     assert "run_ase_db_task_queue_pool(" in uma_parallel_source
 
