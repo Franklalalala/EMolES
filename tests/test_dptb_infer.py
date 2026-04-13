@@ -5,14 +5,14 @@ from emoles.dptb import process_dataset, setup_dataset, setup_db_path, setup_out
 if __name__ == "__main__":
     """Main function to execute the entire workflow."""
     # Configuration paths
-    checkpoint_path = r'nnenv.best.pth'
+    checkpoint_path = r'/personal/dptb_test/nnenv.ep116.pth'
     config_path = r'train_config.json'
     output_path = 'output'
     db_path = r'dump.db'
 
     # Reference dataset information
     reference_info = {
-        "root": r"/share/lmk_1399/1104_no_li_workbase/1104_splited_dptb_format/6311gdp/test",
+        "root": r"/personal/dptb_test/valid",
         "prefix": "data",
         "type": "LMDBDataset",
         "get_Hamiltonian": True,
