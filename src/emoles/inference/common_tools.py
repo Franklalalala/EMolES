@@ -1,4 +1,5 @@
 import os
+import warnings
 from collections import defaultdict
 
 import numpy as np
@@ -40,9 +41,119 @@ def resolve_basis_and_convention(convention):
     return "def2svp", "back2pyscf"
 
 
+_MONOVALENT_CATION_CHARGES = {
+    "Li": 1,
+    "Na": 1,
+    "K": 1,
+}
+
+_CHARGE_WARNING_CACHE = set()
+
+
+def _safe_int(value, default=None):
+    if value is None:
+        return default
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _merged_row_meta(row):
+    merged = {}
+    merged.update(dict(getattr(row, "key_value_pairs", None) or {}))
+    merged.update(dict(getattr(row, "data", None) or {}))
+    return merged
+
+
+def _infer_n_anion_from_meta(meta):
+    explicit = _safe_int(meta.get("n_anion"), None)
+    if explicit is not None:
+        return explicit
+
+    total = 0
+    lig_idx = 0
+    found = False
+    while meta.get(f"lig_{lig_idx}_type") is not None:
+        if str(meta.get(f"lig_{lig_idx}_type")).strip().lower() == "anion":
+            total += _safe_int(meta.get(f"lig_{lig_idx}_count"), 0) or 0
+            found = True
+        lig_idx += 1
+    return total if found else None
+
+
+def _infer_cluster_charge_from_meta(row):
+    meta = _merged_row_meta(row)
+    ion_symbol = meta.get("ion")
+    if ion_symbol is None:
+        return None
+    ion_symbol = str(ion_symbol).strip()
+    ion_charge = _MONOVALENT_CATION_CHARGES.get(ion_symbol)
+    if ion_charge is None:
+        return None
+
+    n_anion = _infer_n_anion_from_meta(meta)
+    if n_anion is None:
+        return None
+
+    atom_numbers = getattr(row, "numbers", None)
+    if atom_numbers is None:
+        return None
+
+    cation_z = None
+    for symbol, charge in _MONOVALENT_CATION_CHARGES.items():
+        if symbol == ion_symbol:
+            cation_z = {"Li": 3, "Na": 11, "K": 19}[symbol]
+            break
+    if cation_z is None:
+        return None
+
+    cation_count = sum(1 for number in atom_numbers if int(number) == cation_z)
+    return int(cation_count * ion_charge - n_anion)
+
+
+def _warn_charge_conflict_once(row, derived_charge, data_charge, kv_charge):
+    meta = _merged_row_meta(row)
+    key = (
+        meta.get("filename"),
+        getattr(row, "id", None),
+        derived_charge,
+        data_charge,
+        kv_charge,
+    )
+    if key in _CHARGE_WARNING_CACHE:
+        return
+    _CHARGE_WARNING_CACHE.add(key)
+    warnings.warn(
+        "[get_row_charge] conflicting row charge fields; "
+        f"use derived cluster charge {derived_charge} "
+        f"(data={data_charge}, key_value_pairs={kv_charge})"
+    )
+
+
 def get_row_charge(row, default=0):
     data = getattr(row, "data", None) or {}
-    return data.get("charge", default)
+    key_value_pairs = getattr(row, "key_value_pairs", None) or {}
+
+    data_charge = _safe_int(data.get("charge"), None)
+    kv_charge = _safe_int(key_value_pairs.get("charge", getattr(row, "charge", None)), None)
+    derived_charge = _infer_cluster_charge_from_meta(row)
+
+    if derived_charge is not None:
+        if data_charge is not None and data_charge != derived_charge:
+            _warn_charge_conflict_once(
+                row=row,
+                derived_charge=derived_charge,
+                data_charge=data_charge,
+                kv_charge=kv_charge,
+            )
+        return derived_charge
+
+    if data_charge is not None:
+        return data_charge
+    if kv_charge is not None:
+        return kv_charge
+    return default
 
 
 def get_row_dielectric_constant(row, default=0):

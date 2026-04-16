@@ -30,6 +30,7 @@ from emoles.inference.common_tools import (
     load_npy_safe,
     resolve_basis_and_convention,
 )
+from emoles.inference.fragment_hosting import infer_orbital_fragment_hosting
 from emoles.pyscf import get_dipole_info
 from emoles.utils import get_pickle_record_any, matrix_transform
 
@@ -451,6 +452,8 @@ def _run_dm_infer_entry(
     gen_esp_cube_flag=False,
     max_items=None,
     unified_pcm_flag=True,
+    calc_fragment_hosting_flag=False,
+    fragment_connectivity_mult=1.1,
     require_existing_work_dir=False,
     updated_ase_db_path="auto",
     keep_aux_files=True,
@@ -573,6 +576,19 @@ def _run_dm_infer_entry(
                             nz=cube_grid,
                         )
 
+                if calc_fragment_hosting_flag and electronic_info_gas is not None:
+                    props.update(
+                        infer_orbital_fragment_hosting(
+                            row=row,
+                            atoms=an_atoms,
+                            mol=mol,
+                            overlap=electronic_info_gas.get("overlap", overlap),
+                            homo_coefficients=electronic_info_gas.get("HOMO_coefficients"),
+                            lumo_coefficients=electronic_info_gas.get("LUMO_coefficients"),
+                            connectivity_mult=fragment_connectivity_mult,
+                        )
+                    )
+
                 if calc_esp_flag:
                     kwargs = {
                         "mol": mol,
@@ -679,6 +695,8 @@ def dm_infer_entry(
     gen_esp_cube_flag=False,
     max_items=None,
     unified_pcm_flag=True,
+    calc_fragment_hosting_flag=False,
+    fragment_connectivity_mult=1.1,
     updated_ase_db_path="auto",
     keep_aux_files=True,
 ):
@@ -700,6 +718,8 @@ def dm_infer_entry(
         gen_esp_cube_flag=gen_esp_cube_flag,
         max_items=max_items,
         unified_pcm_flag=unified_pcm_flag,
+        calc_fragment_hosting_flag=calc_fragment_hosting_flag,
+        fragment_connectivity_mult=fragment_connectivity_mult,
         require_existing_work_dir=True,
         updated_ase_db_path=updated_ase_db_path,
         keep_aux_files=keep_aux_files,
@@ -725,6 +745,8 @@ def dm_infer_entry_from_lmdb(
     gen_esp_cube_flag=False,
     max_items=None,
     unified_pcm_flag=True,
+    calc_fragment_hosting_flag=False,
+    fragment_connectivity_mult=1.1,
     updated_ase_db_path="auto",
     keep_aux_files=True,
 ):
@@ -752,6 +774,8 @@ def dm_infer_entry_from_lmdb(
         gen_esp_cube_flag=gen_esp_cube_flag,
         max_items=max_items,
         unified_pcm_flag=unified_pcm_flag,
+        calc_fragment_hosting_flag=calc_fragment_hosting_flag,
+        fragment_connectivity_mult=fragment_connectivity_mult,
         require_existing_work_dir=False,
         updated_ase_db_path=updated_ase_db_path,
         keep_aux_files=keep_aux_files,
@@ -769,6 +793,8 @@ def dm_infer_light_entry(
     calc_electronic_flag=True,
     max_items=None,
     unified_pcm_flag=True,
+    calc_fragment_hosting_flag=False,
+    fragment_connectivity_mult=1.1,
     summary_json_name=DEFAULT_SUMMARY_JSON_NAME,
     updated_ase_db_path="auto",
 ):
@@ -789,6 +815,8 @@ def dm_infer_light_entry(
         gen_esp_cube_flag=False,
         max_items=max_items,
         unified_pcm_flag=unified_pcm_flag,
+        calc_fragment_hosting_flag=calc_fragment_hosting_flag,
+        fragment_connectivity_mult=fragment_connectivity_mult,
         updated_ase_db_path=updated_ase_db_path,
         keep_aux_files=False,
     )
@@ -806,6 +834,8 @@ def dm_infer_light_entry_from_lmdb(
     calc_electronic_flag=True,
     max_items=None,
     unified_pcm_flag=True,
+    calc_fragment_hosting_flag=False,
+    fragment_connectivity_mult=1.1,
     summary_json_name=DEFAULT_SUMMARY_JSON_NAME,
     updated_ase_db_path="auto",
 ):
@@ -827,6 +857,8 @@ def dm_infer_light_entry_from_lmdb(
         gen_esp_cube_flag=False,
         max_items=max_items,
         unified_pcm_flag=unified_pcm_flag,
+        calc_fragment_hosting_flag=calc_fragment_hosting_flag,
+        fragment_connectivity_mult=fragment_connectivity_mult,
         updated_ase_db_path=updated_ase_db_path,
         keep_aux_files=False,
     )
@@ -843,6 +875,8 @@ def dm_infer_lightning_entry(
     calc_electronic_flag=True,
     max_items=None,
     unified_pcm_flag=True,
+    calc_fragment_hosting_flag=False,
+    fragment_connectivity_mult=1.1,
     summary_json_name=DEFAULT_SUMMARY_JSON_NAME,
     updated_ase_db_path="auto",
 ):
@@ -857,6 +891,8 @@ def dm_infer_lightning_entry(
         calc_electronic_flag=calc_electronic_flag,
         max_items=max_items,
         unified_pcm_flag=unified_pcm_flag,
+        calc_fragment_hosting_flag=calc_fragment_hosting_flag,
+        fragment_connectivity_mult=fragment_connectivity_mult,
         summary_json_name=summary_json_name,
         updated_ase_db_path=updated_ase_db_path,
     )
@@ -874,6 +910,8 @@ def dm_infer_lightning_entry_from_lmdb(
     calc_electronic_flag=True,
     max_items=None,
     unified_pcm_flag=True,
+    calc_fragment_hosting_flag=False,
+    fragment_connectivity_mult=1.1,
     summary_json_name=DEFAULT_SUMMARY_JSON_NAME,
     updated_ase_db_path="auto",
 ):
@@ -889,6 +927,8 @@ def dm_infer_lightning_entry_from_lmdb(
         calc_electronic_flag=calc_electronic_flag,
         max_items=max_items,
         unified_pcm_flag=unified_pcm_flag,
+        calc_fragment_hosting_flag=calc_fragment_hosting_flag,
+        fragment_connectivity_mult=fragment_connectivity_mult,
         summary_json_name=summary_json_name,
         updated_ase_db_path=updated_ase_db_path,
     )
