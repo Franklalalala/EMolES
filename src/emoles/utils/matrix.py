@@ -3,27 +3,33 @@ import numpy as np
 from emoles.constant import convention_dict
 
 
+def _mean_concatenated_blocks(blocks):
+    if not blocks:
+        return float("nan")
+    return float(np.mean(np.concatenate(blocks)))
+
+
 def cut_and_cal_matrix(full_matrix, atom_in_mo_indices):
-    atom_indeces = sorted(set(atom_in_mo_indices))
+    atom_indices = sorted(set(atom_in_mo_indices))
     atom_positions = {
         atom: [i for i, x in enumerate(atom_in_mo_indices) if x == atom]
-        for atom in atom_indeces
+        for atom in atom_indices
     }
-    diag_mae_list = []
-    non_diag_mae_list = []
+    diag_blocks = []
+    non_diag_blocks = []
 
-    for i in atom_indeces:
-        for j in atom_indeces:
+    for i in atom_indices:
+        for j in atom_indices:
             rows = atom_positions[i]
             cols = atom_positions[j]
-            block_mae = float(np.mean(full_matrix[np.ix_(rows, cols)]))
+            block = np.asarray(full_matrix[np.ix_(rows, cols)]).reshape(-1)
             if i == j:
-                diag_mae_list.append(block_mae)
+                diag_blocks.append(block)
             else:
-                non_diag_mae_list.append(block_mae)
+                non_diag_blocks.append(block)
 
-    diag_mae = np.mean(np.array(diag_mae_list))
-    non_diag_mae = np.mean(np.array(non_diag_mae_list))
+    diag_mae = _mean_concatenated_blocks(diag_blocks)
+    non_diag_mae = _mean_concatenated_blocks(non_diag_blocks)
     return diag_mae, non_diag_mae
 
 
