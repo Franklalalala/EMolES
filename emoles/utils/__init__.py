@@ -1,0 +1,1 @@
+﻿from emoles.utils.auto_init import *

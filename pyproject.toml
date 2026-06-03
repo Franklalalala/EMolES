@@ -1,49 +1,44 @@
-[build-system]
-requires = ["setuptools>=42", "wheel"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "EMolES"
-dynamic = ["version"]
+[tool.poetry]
+name = "emoles"
+version = "0.1.0"
+license = "LGPL-3.0"
+description = "Density-matrix electronic-structure models for electrolyte descriptors."
 readme = "README.md"
-description = "A repo to calculate the electronic structures of electrolyte molecules."
-authors = [
-    {name = "Liu Mingkang", email = "1660810667@qq.com"}
+repository = "https://github.com/Franklalalala/EMolES"
+packages = [
+    { include = "emoles" },
+    { include = "dptb" }
 ]
-license = {file = "LICENSE.txt"}
-classifiers = [
-    "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
-    "Intended Audience :: Science/Research",
-]
-requires-python = ">=3.8"
-dependencies = [
-    "numpy",
-    "dptb",
-    "scipy",
-    "pyscf",
-    "scikit-learn",
-    "tqdm",
-    "torch",
-    "py3Dmol",
+include = [
+    "emoles/**/*.pt",
+    "emoles/**/*.pth"
 ]
 
-[tool.setuptools.dynamic]
-version = {file = ["version.txt"]}
+[tool.poetry.dependencies]
+python = ">=3.9, <=3.12.9"
+numpy = "*"
+scipy = "*"
+spglib = "*"
+matplotlib = "*"
+ase = "*"
+pyyaml = "*"
+future = "*"
+dargs = "0.4.4"
+xitorch = "0.3.0"
+e3nn = ">=0.5.1"
+torch-runstats = "0.2.0"
+opt-einsum = "3.3.0"
+h5py = ">=3.7.0,<=3.11.0,!=3.10.0"
+lmdb = "1.4.1"
+tensorboard = "*"
+pandas = "*"
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=6.0",
-    "pytest-cov",
-    "black",
-    "isort",
-    "flake8",
-]
+[tool.poetry.group.dev.dependencies]
+pytest = ">=7.2.0"
 
-[project.urls]
-"Homepage" = "https://github.com/Franklalalala/EMolES"
-"Bug Tracker" = "https://github.com/Franklalalala/EMolES/issues"
+[tool.poetry.scripts]
+emoles = "emoles.__main__:main"
 
-[tool.setuptools]
-packages = ["emoles"]
-
+[build-system]
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"
