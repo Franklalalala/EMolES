@@ -17,10 +17,8 @@ The model stack follows the EMolES paper definition:
 - Element-conditioned tensor-product output layers for density-matrix node and
   edge blocks.
 
-This repository is now an independent EMolES runtime. It was migrated from the
-historical `DeePTB/emoles-stable` development branch, but the public package
-name, CLI, and README are EMolES-first. A tiny `dptb` compatibility shim remains
-only so older checkpoint/module paths can be resolved during transition.
+This repository is an independent EMolES runtime. A small `dptb` compatibility
+shim is kept only for transitional checkpoint/module path resolution.
 
 ## Install
 
@@ -62,11 +60,9 @@ workspace checkpoint manifest used during migration is:
 E:/thu/emolkit_paper/0512_data/emoles_test_results_fixed/checkpoints/checkpoint_manifest.json
 ```
 
-EMolStudio should import the new package through `emoles`. Existing
-`emolstudio.emoles` adapter code can fall back through the compatibility shim
-for old checkpoint paths while forwarding new runtime imports to this library.
+EMolStudio should import the new package through `emoles`; existing adapter code
+can forward historical checkpoint paths to this runtime during migration.
 
 ## Links
 
 - EMolES repository: https://github.com/Franklalalala/EMolES
-- Historical source branch: https://github.com/Franklalalala/DeePTB/tree/emoles-stable
